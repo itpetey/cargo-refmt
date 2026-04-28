@@ -21,6 +21,8 @@ struct Args {
 fn blank_lines_after(category: usize) -> usize {
     match category {
         0..=7 => 0,
+        8..=12 => 1,
+        13 => 1,
         _ => 1,
     }
 }
@@ -43,7 +45,27 @@ fn category(item: &Item) -> Cat {
         Item::Type(_) => 6,
         Item::Const(_) | Item::Static(_) => 7,
         Item::Trait(_) | Item::TraitAlias(_) => 8,
-        Item::Struct(_) | Item::Enum(_) | Item::Union(_) => 9,
+        Item::Struct(s) => {
+            if matches!(s.vis, syn::Visibility::Public(_)) {
+                9
+            } else {
+                13
+            }
+        }
+        Item::Enum(e) => {
+            if matches!(e.vis, syn::Visibility::Public(_)) {
+                9
+            } else {
+                13
+            }
+        }
+        Item::Union(u) => {
+            if matches!(u.vis, syn::Visibility::Public(_)) {
+                9
+            } else {
+                13
+            }
+        }
         Item::Impl(_) => 10,
         Item::Fn(_) | Item::ForeignMod(_) | Item::Macro(_) | Item::Verbatim(_) => 11,
         _ => 11,
@@ -283,9 +305,17 @@ fn impl_type_name(impl_snippet: &str) -> String {
             trimmed[..pos].trim().to_string()
         } else if let Some(for_pos) = trimmed.find(" for ") {
             let after_for = trimmed[for_pos + 5..].trim();
-            after_for.split_whitespace().next().unwrap_or(after_for).to_string()
+            after_for
+                .split_whitespace()
+                .next()
+                .unwrap_or(after_for)
+                .to_string()
         } else {
-            trimmed.split_whitespace().next().unwrap_or(trimmed).to_string()
+            trimmed
+                .split_whitespace()
+                .next()
+                .unwrap_or(trimmed)
+                .to_string()
         }
     } else {
         String::new()
@@ -436,7 +466,8 @@ fn reorder_file(path: &Path) -> Result<()> {
         .filter_map(|item| item_name(item))
         .collect();
 
-    let mut buckets: Vec<Vec<String>> = vec![Vec::new(); 13];
+    let mut buckets: Vec<Vec<String>> = vec![Vec::new(); 14];
+
     for item in other_items.into_iter() {
         let cat = category(&item);
         let snippet = item_snippet(&item, &src, &line_starts);
@@ -445,7 +476,28 @@ fn reorder_file(path: &Path) -> Result<()> {
 
     for item in sorted_struct_enums.into_iter() {
         let snippet = item_snippet(&item, &src, &line_starts);
-        buckets[9].push(snippet);
+        let cat = if let Item::Struct(s) = &item {
+            if matches!(s.vis, syn::Visibility::Public(_)) {
+                9
+            } else {
+                13
+            }
+        } else if let Item::Enum(e) = &item {
+            if matches!(e.vis, syn::Visibility::Public(_)) {
+                9
+            } else {
+                13
+            }
+        } else if let Item::Union(u) = &item {
+            if matches!(u.vis, syn::Visibility::Public(_)) {
+                9
+            } else {
+                13
+            }
+        } else {
+            9
+        };
+        buckets[cat].push(snippet);
     }
 
     for item in sorted_fn_items.into_iter() {
@@ -466,7 +518,12 @@ fn reorder_file(path: &Path) -> Result<()> {
 
     let mut wrote_any = !out.is_empty();
 
-    for (idx, mut bucket) in buckets.into_iter().enumerate() {
+    let order = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 10, 11, 12];
+    for idx in order {
+        let bucket = match buckets.get_mut(idx) {
+            Some(b) => b,
+            None => continue,
+        };
         if bucket.is_empty() {
             continue;
         }
@@ -484,7 +541,9 @@ fn reorder_file(path: &Path) -> Result<()> {
                     (None, None) => std::cmp::Ordering::Greater,
                 }
             });
-        } else if idx != 9 && idx != 11 {
+        } else if idx == 9 || idx == 13 {
+            // Keep structs in original order - don't sort
+        } else if idx != 11 {
             bucket.sort();
         }
 

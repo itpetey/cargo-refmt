@@ -433,3 +433,58 @@ pub type ValidatorId = &'static str;
 "
     );
 }
+
+#[test]
+fn test_private_structs_after_public() {
+    let path = test_dir().join("private_structs.rs");
+    fs::write(
+        &path,
+        "\
+#[derive(Clone)]
+pub struct PublicStruct {
+    x: i32,
+}
+
+struct PrivateStruct {
+    y: i32,
+}
+
+pub enum PublicEnum {
+    A,
+    B,
+}
+
+struct PrivateEnum {
+    x: i32,
+}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    let public_struct_pos = result.find("pub struct PublicStruct").expect("public struct not found");
+    let private_struct_pos = result.find("struct PrivateStruct").expect("private struct not found");
+    let public_enum_pos = result.find("pub enum PublicEnum").expect("public enum not found");
+    let private_enum_pos = result.find("struct PrivateEnum").expect("private enum not found");
+
+    assert!(
+        public_struct_pos < private_struct_pos,
+        "public struct should come before private struct: public at {}, private at {}",
+        public_struct_pos,
+        private_struct_pos
+    );
+    assert!(
+        public_enum_pos < private_enum_pos,
+        "public enum should come before private enum: public at {}, private at {}",
+        public_enum_pos,
+        private_enum_pos
+    );
+    
+    assert!(
+        private_struct_pos < private_enum_pos,
+        "private struct should come before private enum: private struct at {}, private enum at {}",
+        private_struct_pos,
+        private_enum_pos
+    );
+}
