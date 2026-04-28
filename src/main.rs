@@ -20,27 +20,33 @@ struct Args {
 
 fn blank_lines_after(category: usize) -> usize {
     match category {
-        0..=6 => 0,
+        0..=7 => 0,
         _ => 1,
     }
 }
 
 fn category(item: &Item) -> Cat {
     if is_test_module(item) {
-        return 11;
+        return 12;
     }
 
     match item {
-        Item::Use(use_item) => use_category(use_item),
-        Item::Mod(_) => 3,
-        Item::ExternCrate(_) => 4,
-        Item::Type(_) => 5,
-        Item::Const(_) | Item::Static(_) => 6,
-        Item::Trait(_) | Item::TraitAlias(_) => 7,
-        Item::Struct(_) | Item::Enum(_) | Item::Union(_) => 8,
-        Item::Impl(_) => 9,
-        Item::Fn(_) | Item::ForeignMod(_) | Item::Macro(_) | Item::Verbatim(_) => 10,
-        _ => 10,
+        Item::Use(use_item) => {
+            if matches!(use_item.vis, syn::Visibility::Public(_)) {
+                3
+            } else {
+                use_category(use_item)
+            }
+        }
+        Item::Mod(_) => 4,
+        Item::ExternCrate(_) => 5,
+        Item::Type(_) => 6,
+        Item::Const(_) | Item::Static(_) => 7,
+        Item::Trait(_) | Item::TraitAlias(_) => 8,
+        Item::Struct(_) | Item::Enum(_) | Item::Union(_) => 9,
+        Item::Impl(_) => 10,
+        Item::Fn(_) | Item::ForeignMod(_) | Item::Macro(_) | Item::Verbatim(_) => 11,
+        _ => 11,
     }
 }
 
@@ -430,7 +436,7 @@ fn reorder_file(path: &Path) -> Result<()> {
         .filter_map(|item| item_name(item))
         .collect();
 
-    let mut buckets: Vec<Vec<String>> = vec![Vec::new(); 12];
+    let mut buckets: Vec<Vec<String>> = vec![Vec::new(); 13];
     for item in other_items.into_iter() {
         let cat = category(&item);
         let snippet = item_snippet(&item, &src, &line_starts);
@@ -439,12 +445,12 @@ fn reorder_file(path: &Path) -> Result<()> {
 
     for item in sorted_struct_enums.into_iter() {
         let snippet = item_snippet(&item, &src, &line_starts);
-        buckets[8].push(snippet);
+        buckets[9].push(snippet);
     }
 
     for item in sorted_fn_items.into_iter() {
         let snippet = item_snippet(&item, &src, &line_starts);
-        buckets[10].push(snippet);
+        buckets[11].push(snippet);
     }
 
     let mut out = String::new();
@@ -465,7 +471,7 @@ fn reorder_file(path: &Path) -> Result<()> {
             continue;
         }
 
-        if idx == 9 {
+        if idx == 10 {
             bucket.sort_by(|a, b| {
                 let name_a = impl_type_name(a);
                 let name_b = impl_type_name(b);
@@ -478,7 +484,7 @@ fn reorder_file(path: &Path) -> Result<()> {
                     (None, None) => std::cmp::Ordering::Greater,
                 }
             });
-        } else if idx != 8 && idx != 10 {
+        } else if idx != 9 && idx != 11 {
             bucket.sort();
         }
 
@@ -663,11 +669,12 @@ mod tests {
         assert_eq!(blank_lines_after(4), 0);
         assert_eq!(blank_lines_after(5), 0);
         assert_eq!(blank_lines_after(6), 0);
-        assert_eq!(blank_lines_after(7), 1);
+        assert_eq!(blank_lines_after(7), 0);
         assert_eq!(blank_lines_after(8), 1);
         assert_eq!(blank_lines_after(9), 1);
         assert_eq!(blank_lines_after(10), 1);
         assert_eq!(blank_lines_after(11), 1);
+        assert_eq!(blank_lines_after(12), 1);
     }
 
     #[test]
