@@ -166,6 +166,8 @@ fn test_impl_order_by_type_order() {
     fs::write(
         &path,
         "\
+trait ArtifactLookup {}
+
 pub struct ArtifactId(pub String);
 
 pub struct TransitionId(pub String);
@@ -185,6 +187,8 @@ impl ArtifactRef {
         self.data
     }
 }
+
+impl ArtifactLookup for ArtifactId {}
 
 impl Default for ArtifactId {
     fn default() -> Self {
@@ -206,6 +210,8 @@ impl TransitionId {
     assert_eq!(
         result,
         "\
+trait ArtifactLookup {}
+
 pub struct ArtifactId(pub String);
 
 pub struct TransitionId(pub String);
@@ -219,6 +225,8 @@ impl ArtifactId {
         Self(String::new())
     }
 }
+
+impl ArtifactLookup for ArtifactId {}
 
 impl Default for ArtifactId {
     fn default() -> Self {
@@ -237,6 +245,154 @@ impl ArtifactRef {
         self.data
     }
 }
+"
+    );
+}
+
+#[test]
+fn test_impl_order_with_generics_paths_and_unknown_targets() {
+    let path = test_dir().join("impl_order_generics.rs");
+    fs::write(
+        &path,
+        "\
+trait Display {}
+
+trait LocalTrait {}
+
+struct Local;
+
+struct Generic<T> {
+    value: T,
+}
+
+impl<T> std::fmt::Display for Generic<T>
+where
+    T: std::fmt::Display,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(formatter)
+    }
+}
+
+impl external::Local {
+    fn external() {}
+}
+
+impl<T> LocalTrait for Generic<T> {}
+
+impl<T> Generic<T> {
+    fn value(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> Generic<T> {
+    fn into_value(self) -> T {
+        self.value
+    }
+}
+
+impl crate::Local {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for Generic<u8> {
+    fn default() -> Self {
+        Self { value: 0 }
+    }
+}
+
+impl<T> Display for Generic<T> {}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert_eq!(
+        result,
+        "\
+trait Display {}
+
+trait LocalTrait {}
+
+struct Local;
+
+struct Generic<T> {
+    value: T,
+}
+
+impl crate::Local {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl<T> Generic<T> {
+    fn value(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> Generic<T> {
+    fn into_value(self) -> T {
+        self.value
+    }
+}
+
+impl<T> LocalTrait for Generic<T> {}
+
+impl<T> Display for Generic<T> {}
+
+impl<T> std::fmt::Display for Generic<T>
+where
+    T: std::fmt::Display,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(formatter)
+    }
+}
+
+impl Default for Generic<u8> {
+    fn default() -> Self {
+        Self { value: 0 }
+    }
+}
+
+impl external::Local {
+    fn external() {}
+}
+"
+    );
+}
+
+#[test]
+fn test_type_order_preserves_source_order() {
+    let path = test_dir().join("sort_by_usage.rs");
+    fs::write(
+        &path,
+        "\
+enum Foo {
+    Opt(Bar),
+}
+
+struct Bar;
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert_eq!(
+        result,
+        "\
+enum Foo {
+    Opt(Bar),
+}
+
+struct Bar;
 "
     );
 }
@@ -435,27 +591,27 @@ pub type ValidatorId = &'static str;
 }
 
 #[test]
-fn test_private_structs_after_public() {
+fn test_type_order_preserves_mixed_visibility_source_order() {
     let path = test_dir().join("private_structs.rs");
     fs::write(
         &path,
         "\
+struct PrivateStruct {
+    y: i32,
+}
+
 #[derive(Clone)]
 pub struct PublicStruct {
     x: i32,
 }
 
-struct PrivateStruct {
-    y: i32,
+struct PrivateEnum {
+    x: i32,
 }
 
 pub enum PublicEnum {
     A,
     B,
-}
-
-struct PrivateEnum {
-    x: i32,
 }
 ",
     )
@@ -463,28 +619,36 @@ struct PrivateEnum {
 
     let result = run_reorder(&path);
 
-    let public_struct_pos = result.find("pub struct PublicStruct").expect("public struct not found");
-    let private_struct_pos = result.find("struct PrivateStruct").expect("private struct not found");
-    let public_enum_pos = result.find("pub enum PublicEnum").expect("public enum not found");
-    let private_enum_pos = result.find("struct PrivateEnum").expect("private enum not found");
+    let public_struct_pos = result
+        .find("pub struct PublicStruct")
+        .expect("public struct not found");
+    let private_struct_pos = result
+        .find("struct PrivateStruct")
+        .expect("private struct not found");
+    let public_enum_pos = result
+        .find("pub enum PublicEnum")
+        .expect("public enum not found");
+    let private_enum_pos = result
+        .find("struct PrivateEnum")
+        .expect("private enum not found");
 
     assert!(
-        public_struct_pos < private_struct_pos,
-        "public struct should come before private struct: public at {}, private at {}",
-        public_struct_pos,
-        private_struct_pos
-    );
-    assert!(
-        public_enum_pos < private_enum_pos,
-        "public enum should come before private enum: public at {}, private at {}",
-        public_enum_pos,
-        private_enum_pos
-    );
-    
-    assert!(
-        private_struct_pos < private_enum_pos,
-        "private struct should come before private enum: private struct at {}, private enum at {}",
+        private_struct_pos < public_struct_pos,
+        "private struct should keep source order before public struct: private at {}, public at {}",
         private_struct_pos,
+        public_struct_pos,
+    );
+    assert!(
+        private_enum_pos < public_enum_pos,
+        "private enum should keep source order before public enum: private at {}, public at {}",
+        private_enum_pos,
+        public_enum_pos
+    );
+
+    assert!(
+        public_struct_pos < private_enum_pos,
+        "public struct should keep source order before private enum: public struct at {}, private enum at {}",
+        public_struct_pos,
         private_enum_pos
     );
 }

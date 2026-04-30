@@ -1,3 +1,5 @@
+trait ArtifactLookup {}
+
 pub struct ArtifactId(pub String);
 
 pub struct TransitionId(pub String);
@@ -11,6 +13,8 @@ impl ArtifactId {
         Self(String::new())
     }
 }
+
+impl ArtifactLookup for ArtifactId {}
 
 impl Default for ArtifactId {
     fn default() -> Self {

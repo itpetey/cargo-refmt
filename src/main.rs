@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +16,13 @@ type Cat = usize;
 struct Args {
     #[arg(value_name = "PATH")]
     paths: Vec<PathBuf>,
+}
+
+struct ImplSnippet {
+    target: Option<String>,
+    sort_category: usize,
+    source_order: usize,
+    snippet: String,
 }
 
 fn blank_lines_after(category: usize) -> usize {
@@ -164,92 +171,6 @@ fn contains_test(expr: &syn::Expr) -> bool {
     }
 }
 
-fn find_item_range(name: &str, src: &str) -> Option<(usize, usize)> {
-    let pattern = format!("{} {{", name);
-    if let Some(start) = src.find(&pattern) {
-        let mut brace_count = 0;
-        let mut in_body = false;
-        for (i, c) in src[start..].char_indices() {
-            if c == '{' {
-                brace_count += 1;
-                in_body = true;
-            } else if c == '}' {
-                brace_count -= 1;
-                if in_body && brace_count == 0 {
-                    return Some((start, start + i + 1));
-                }
-            }
-        }
-    }
-
-    if let Some(start) = src.find(&format!("{};", name)) {
-        return Some((start, start + name.len() + 1));
-    }
-
-    None
-}
-
-fn find_references(names: &[String], src: &str) -> HashMap<String, Vec<String>> {
-    let mut refs: HashMap<String, Vec<String>> = HashMap::new();
-
-    for name in names {
-        refs.insert(name.clone(), Vec::new());
-    }
-
-    let name_to_range: HashMap<String, (usize, usize)> = names
-        .iter()
-        .filter_map(|n| {
-            let range = find_item_range(n, src)?;
-            Some((n.clone(), range))
-        })
-        .collect();
-
-    let mut i = 0;
-    let bytes = src.as_bytes();
-    while i < bytes.len() {
-        if bytes[i] == b'/' && i + 1 < bytes.len() {
-            if bytes[i + 1] == b'/' {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
-            } else if bytes[i + 1] == b'*' {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i += 2;
-                continue;
-            }
-        }
-
-        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
-            let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            let word = &src[start..i];
-
-            if names.iter().any(|n| word == *n) {
-                for (name, range) in &name_to_range {
-                    if start >= range.0
-                        && start <= range.1
-                        && word != name
-                        && let Some(v) = refs.get_mut(name)
-                        && !v.contains(&word.to_string())
-                    {
-                        v.push(word.to_string());
-                    }
-                }
-            }
-            continue;
-        }
-        i += 1;
-    }
-
-    refs
-}
-
 fn fn_item_name(item: &Item) -> String {
     match item {
         Item::Fn(fn_item) => fn_item.sig.ident.to_string(),
@@ -297,28 +218,116 @@ fn header_to_string(attrs: &[Attribute], src: &str, line_starts: &[usize]) -> St
     src[start..end].to_string()
 }
 
-fn impl_type_name(impl_snippet: &str) -> String {
-    let impl_keyword = "impl";
-    if let Some(start) = impl_snippet.strip_prefix(impl_keyword) {
-        let trimmed = start.trim();
-        if let Some(pos) = trimmed.find('<') {
-            trimmed[..pos].trim().to_string()
-        } else if let Some(for_pos) = trimmed.find(" for ") {
-            let after_for = trimmed[for_pos + 5..].trim();
-            after_for
-                .split_whitespace()
-                .next()
-                .unwrap_or(after_for)
-                .to_string()
-        } else {
-            trimmed
-                .split_whitespace()
-                .next()
-                .unwrap_or(trimmed)
-                .to_string()
+fn impl_sort_category(impl_item: &syn::ItemImpl, local_traits: &HashSet<String>) -> usize {
+    match &impl_item.trait_ {
+        None => 0,
+        Some((_, trait_path, _)) => {
+            if is_rust_trait(trait_path, local_traits) {
+                2
+            } else {
+                1
+            }
         }
+    }
+}
+
+fn impl_type_name(impl_item: &syn::ItemImpl) -> Option<String> {
+    type_key(&impl_item.self_ty)
+}
+
+fn impl_target_matches_type(target: Option<&str>, type_name: &str) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+
+    if target == type_name {
+        return true;
+    }
+
+    let segments = target.split("::").collect::<Vec<_>>();
+    matches!(segments.first(), Some(&"crate" | &"self" | &"super"))
+        && segments.last().is_some_and(|segment| *segment == type_name)
+}
+
+fn is_rust_trait(trait_path: &syn::Path, local_traits: &HashSet<String>) -> bool {
+    let std_traits = [
+        "Drop",
+        "Clone",
+        "Copy",
+        "Debug",
+        "Display",
+        "From",
+        "Into",
+        "AsRef",
+        "AsMut",
+        "Deref",
+        "DerefMut",
+        "Iterator",
+        "IntoIterator",
+        "Eq",
+        "PartialEq",
+        "Ord",
+        "PartialOrd",
+        "Hash",
+        "Default",
+        "Send",
+        "Sync",
+        "Fn",
+        "FnOnce",
+        "FnMut",
+        "Future",
+        "Stream",
+        "Error",
+        "ToOwned",
+        "Borrow",
+        "BorrowMut",
+        "AsHandle",
+        "AsRawHandle",
+        "FromStr",
+        "TryFrom",
+        "TryInto",
+        "Index",
+        "IndexMut",
+    ];
+
+    let first = trait_path
+        .segments
+        .first()
+        .map(|segment| segment.ident.to_string());
+    let last = trait_path
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string());
+
+    if matches!(first.as_deref(), Some("std" | "core" | "alloc")) {
+        return true;
+    }
+
+    last.as_deref().is_some_and(|trait_name| {
+        !local_traits.contains(trait_name) && std_traits.contains(&trait_name)
+    })
+}
+
+fn path_key(path: &syn::Path) -> Option<String> {
+    let segments = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        None
     } else {
-        String::new()
+        Some(segments.join("::"))
+    }
+}
+
+fn type_key(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Group(group) => type_key(&group.elem),
+        syn::Type::Paren(paren) => type_key(&paren.elem),
+        syn::Type::Path(path) => path_key(&path.path),
+        syn::Type::Reference(reference) => type_key(&reference.elem),
+        _ => None,
     }
 }
 
@@ -434,6 +443,108 @@ fn push_file(path: PathBuf, files: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf
     }
 }
 
+fn collect_impls_and_bucket_rest(
+    items: Vec<Item>,
+    buckets: &mut [Vec<String>],
+    src: &str,
+    line_starts: &[usize],
+) -> Vec<ImplSnippet> {
+    let mut impls = Vec::new();
+    let local_traits = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Trait(item) => Some(item.ident.to_string()),
+            Item::TraitAlias(item) => Some(item.ident.to_string()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+
+    for (source_order, item) in items.into_iter().enumerate() {
+        if let Item::Impl(impl_item) = &item {
+            impls.push(ImplSnippet {
+                target: impl_type_name(impl_item),
+                sort_category: impl_sort_category(impl_item, &local_traits),
+                source_order,
+                snippet: item_snippet(&item, src, line_starts),
+            });
+        } else {
+            let cat = category(&item);
+            buckets[cat].push(item_snippet(&item, src, line_starts));
+        }
+    }
+
+    impls
+}
+
+fn push_ordered_impls(impls: Vec<ImplSnippet>, type_order: &[String], bucket: &mut Vec<String>) {
+    let mut used_impls = vec![false; impls.len()];
+
+    for type_name in type_order {
+        let mut matching_impls = impls
+            .iter()
+            .enumerate()
+            .filter(|(_, impl_item)| {
+                impl_target_matches_type(impl_item.target.as_deref(), type_name)
+            })
+            .collect::<Vec<_>>();
+        matching_impls
+            .sort_by_key(|(_, impl_item)| (impl_item.sort_category, impl_item.source_order));
+
+        for (index, impl_item) in matching_impls {
+            used_impls[index] = true;
+            bucket.push(impl_item.snippet.clone());
+        }
+    }
+
+    for (index, impl_item) in impls.into_iter().enumerate() {
+        if !used_impls[index] {
+            bucket.push(impl_item.snippet);
+        }
+    }
+}
+
+fn push_type_items(
+    items: Vec<Item>,
+    buckets: &mut [Vec<String>],
+    src: &str,
+    line_starts: &[usize],
+) {
+    for item in items {
+        buckets[9].push(item_snippet(&item, src, line_starts));
+    }
+}
+
+fn write_bucket(out: &mut String, bucket: &mut Vec<String>, category: usize, wrote_any: &mut bool) {
+    if bucket.is_empty() {
+        return;
+    }
+
+    if category == 9 || category == 10 || category == 13 {
+        // These buckets carry their semantic order from earlier grouping.
+    } else if category != 11 {
+        bucket.sort();
+    }
+
+    if *wrote_any && category != 0 {
+        while !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+    }
+    *wrote_any = true;
+
+    let extra_blank = blank_lines_after(category);
+    let bucket_len = bucket.len();
+    for (i, item) in bucket.drain(..).enumerate() {
+        out.push_str(item.trim_end_matches('\n'));
+        out.push('\n');
+        if i + 1 < bucket_len {
+            for _ in 0..extra_blank {
+                out.push('\n');
+            }
+        }
+    }
+}
+
 fn reorder_file(path: &Path) -> Result<()> {
     let src = fs::read_to_string(path).with_context(|| format!("read file {}", path.display()))?;
     let mut file: File =
@@ -452,7 +563,7 @@ fn reorder_file(path: &Path) -> Result<()> {
         .into_iter()
         .partition(|item| matches!(item, Item::Fn(_)));
 
-    let sorted_struct_enums = sort_by_usage(struct_enum_items, &src, &line_starts);
+    let sorted_struct_enums = struct_enum_items;
 
     let mut sorted_fn_items = fn_items;
     sorted_fn_items.sort_by(|a, b| {
@@ -461,44 +572,17 @@ fn reorder_file(path: &Path) -> Result<()> {
             .then_with(|| fn_item_name(a).cmp(&fn_item_name(b)))
     });
 
+    let mut buckets: Vec<Vec<String>> = vec![Vec::new(); 14];
+
+    let impl_items = collect_impls_and_bucket_rest(other_items, &mut buckets, &src, &line_starts);
+
     let type_order: Vec<String> = sorted_struct_enums
         .iter()
         .filter_map(|item| item_name(item))
         .collect();
 
-    let mut buckets: Vec<Vec<String>> = vec![Vec::new(); 14];
-
-    for item in other_items.into_iter() {
-        let cat = category(&item);
-        let snippet = item_snippet(&item, &src, &line_starts);
-        buckets[cat].push(snippet);
-    }
-
-    for item in sorted_struct_enums.into_iter() {
-        let snippet = item_snippet(&item, &src, &line_starts);
-        let cat = if let Item::Struct(s) = &item {
-            if matches!(s.vis, syn::Visibility::Public(_)) {
-                9
-            } else {
-                13
-            }
-        } else if let Item::Enum(e) = &item {
-            if matches!(e.vis, syn::Visibility::Public(_)) {
-                9
-            } else {
-                13
-            }
-        } else if let Item::Union(u) = &item {
-            if matches!(u.vis, syn::Visibility::Public(_)) {
-                9
-            } else {
-                13
-            }
-        } else {
-            9
-        };
-        buckets[cat].push(snippet);
-    }
+    push_type_items(sorted_struct_enums, &mut buckets, &src, &line_starts);
+    push_ordered_impls(impl_items, &type_order, &mut buckets[10]);
 
     for item in sorted_fn_items.into_iter() {
         let snippet = item_snippet(&item, &src, &line_starts);
@@ -520,51 +604,8 @@ fn reorder_file(path: &Path) -> Result<()> {
 
     let order = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 10, 11, 12];
     for idx in order {
-        let bucket = match buckets.get_mut(idx) {
-            Some(b) => b,
-            None => continue,
-        };
-        if bucket.is_empty() {
-            continue;
-        }
-
-        if idx == 10 {
-            bucket.sort_by(|a, b| {
-                let name_a = impl_type_name(a);
-                let name_b = impl_type_name(b);
-                let pos_a = type_order.iter().position(|n| n == &name_a);
-                let pos_b = type_order.iter().position(|n| n == &name_b);
-                match (pos_a, pos_b) {
-                    (Some(i), Some(j)) => i.cmp(&j),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Greater,
-                }
-            });
-        } else if idx == 9 || idx == 13 {
-            // Keep structs in original order - don't sort
-        } else if idx != 11 {
-            bucket.sort();
-        }
-
-        if wrote_any && idx != 0 {
-            while !out.ends_with("\n\n") {
-                out.push('\n');
-            }
-        }
-        wrote_any = true;
-
-        let extra_blank = blank_lines_after(idx);
-
-        let bucket_len = bucket.len();
-        for (i, item) in bucket.into_iter().enumerate() {
-            out.push_str(item.trim_end_matches('\n'));
-            out.push('\n');
-            if i + 1 < bucket_len {
-                for _ in 0..extra_blank {
-                    out.push('\n');
-                }
-            }
+        if let Some(bucket) = buckets.get_mut(idx) {
+            write_bucket(&mut out, bucket, idx, &mut wrote_any);
         }
     }
 
@@ -584,46 +625,6 @@ fn reorder_file(path: &Path) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn sort_by_usage(items: Vec<Item>, src: &str, _line_starts: &[usize]) -> Vec<Item> {
-    if items.is_empty() {
-        return items;
-    }
-
-    let mut name_to_item: HashMap<String, Item> = HashMap::new();
-    let mut names: Vec<String> = Vec::new();
-
-    for item in &items {
-        let name = item_name(item);
-        if let Some(n) = name {
-            name_to_item.insert(n.clone(), item.clone());
-            names.push(n);
-        }
-    }
-
-    let refs = find_references(&names, src);
-
-    let mut outgoing_counts: HashMap<String, usize> = HashMap::new();
-    for name in &names {
-        outgoing_counts.insert(name.clone(), refs.get(name).map(|v| v.len()).unwrap_or(0));
-    }
-
-    let mut name_count: Vec<(String, usize)> = names
-        .iter()
-        .map(|n| (n.clone(), *outgoing_counts.get(n).unwrap_or(&0)))
-        .collect();
-
-    name_count.sort_by(|a, b| b.1.cmp(&a.1));
-
-    let mut sorted: Vec<Item> = Vec::new();
-    for (name, _) in name_count {
-        if let Some(item) = name_to_item.get(&name) {
-            sorted.push(item.clone());
-        }
-    }
-
-    sorted
 }
 
 fn span_range(
@@ -734,26 +735,5 @@ mod tests {
         assert_eq!(blank_lines_after(10), 1);
         assert_eq!(blank_lines_after(11), 1);
         assert_eq!(blank_lines_after(12), 1);
-    }
-
-    #[test]
-    fn test_find_item_range_with_braces() {
-        let src = "struct Foo { field: i32 }";
-        let range = find_item_range("Foo", src);
-        assert_eq!(range, Some((7, 25)));
-    }
-
-    #[test]
-    fn test_find_item_range_with_semicolon() {
-        let src = "struct Foo;";
-        let range = find_item_range("Foo", src);
-        assert_eq!(range, Some((7, 11)));
-    }
-
-    #[test]
-    fn test_find_item_range_not_found() {
-        let src = "struct Bar { field: i32 }";
-        let range = find_item_range("Foo", src);
-        assert!(range.is_none());
     }
 }
