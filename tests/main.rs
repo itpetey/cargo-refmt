@@ -369,7 +369,7 @@ impl external::Local {
 }
 
 #[test]
-fn test_type_order_preserves_source_order() {
+fn test_type_order_dependency_before_dependent() {
     let path = test_dir().join("sort_by_usage.rs");
     fs::write(
         &path,
@@ -388,12 +388,50 @@ struct Bar;
     assert_eq!(
         result,
         "\
+struct Bar;
+
 enum Foo {
     Opt(Bar),
 }
-
-struct Bar;
 "
+    );
+}
+
+#[test]
+fn test_guest_context_before_shared_memory_handle() {
+    let path = test_dir().join("guest_context_dependencies.rs");
+    fs::write(
+        &path,
+        "\
+pub struct SharedMemoryHandle {
+    context: GuestContext,
+    descriptor: SharedMappingDescriptor,
+    owns_region: bool,
+}
+
+#[derive(Clone)]
+pub struct GuestContext {
+    host: Arc<dyn GuestHost>,
+    scope_context: ScopeContext,
+}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    let guest_context_pos = result
+        .find("pub struct GuestContext")
+        .expect("GuestContext not found");
+    let shared_memory_pos = result
+        .find("pub struct SharedMemoryHandle")
+        .expect("SharedMemoryHandle not found");
+
+    assert!(
+        guest_context_pos < shared_memory_pos,
+        "GuestContext should come before SharedMemoryHandle: GuestContext at {}, SharedMemoryHandle at {}",
+        guest_context_pos,
+        shared_memory_pos
     );
 }
 

@@ -1,10 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use syn::spanned::Spanned;
+use syn::visit::Visit;
 use syn::{Attribute, File, Item};
 
 type Cat = usize;
@@ -476,6 +477,90 @@ fn collect_impls_and_bucket_rest(
     impls
 }
 
+struct TypeDependencyVisitor<'a> {
+    local_types: &'a HashSet<String>,
+    dependencies: HashSet<String>,
+}
+
+impl Visit<'_> for TypeDependencyVisitor<'_> {
+    fn visit_type_path(&mut self, path: &syn::TypePath) {
+        for segment in &path.path.segments {
+            let ident = segment.ident.to_string();
+            if self.local_types.contains(&ident) {
+                self.dependencies.insert(ident);
+            }
+        }
+
+        syn::visit::visit_type_path(self, path);
+    }
+}
+
+fn collect_type_item_dependencies(item: &Item, local_types: &HashSet<String>) -> HashSet<String> {
+    let mut visitor = TypeDependencyVisitor {
+        local_types,
+        dependencies: HashSet::new(),
+    };
+
+    match item {
+        Item::Struct(item) => visitor.visit_fields(&item.fields),
+        Item::Enum(item) => {
+            for variant in &item.variants {
+                visitor.visit_fields(&variant.fields);
+            }
+        }
+        Item::Union(item) => visitor.visit_fields_named(&item.fields),
+        _ => {}
+    }
+
+    if let Some(name) = item_name(item) {
+        visitor.dependencies.remove(&name);
+    }
+
+    visitor.dependencies
+}
+
+fn sort_type_items_by_dependencies(items: Vec<Item>) -> Vec<Item> {
+    let local_types = items.iter().filter_map(item_name).collect::<HashSet<_>>();
+    let type_indexes = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| item_name(item).map(|name| (name, index)))
+        .collect::<HashMap<_, _>>();
+    let dependency_indexes = items
+        .iter()
+        .map(|item| {
+            collect_type_item_dependencies(item, &local_types)
+                .into_iter()
+                .filter_map(|dependency| type_indexes.get(&dependency).copied())
+                .collect::<HashSet<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let mut items = items.into_iter().map(Some).collect::<Vec<_>>();
+    let mut placed = vec![false; items.len()];
+    let mut sorted = Vec::with_capacity(items.len());
+
+    while sorted.len() < items.len() {
+        let next = (0..items.len())
+            .find(|&index| {
+                !placed[index]
+                    && dependency_indexes[index]
+                        .iter()
+                        .all(|dependency| placed[*dependency])
+            })
+            .or_else(|| (0..items.len()).find(|&index| !placed[index]));
+
+        let Some(index) = next else {
+            break;
+        };
+
+        placed[index] = true;
+        sorted.push(items[index].take().expect("type item should be present"));
+    }
+
+    sorted
+}
+
 fn push_ordered_impls(impls: Vec<ImplSnippet>, type_order: &[String], bucket: &mut Vec<String>) {
     let mut used_impls = vec![false; impls.len()];
 
@@ -563,7 +648,7 @@ fn reorder_file(path: &Path) -> Result<()> {
         .into_iter()
         .partition(|item| matches!(item, Item::Fn(_)));
 
-    let sorted_struct_enums = struct_enum_items;
+    let sorted_struct_enums = sort_type_items_by_dependencies(struct_enum_items);
 
     let mut sorted_fn_items = fn_items;
     sorted_fn_items.sort_by(|a, b| {
