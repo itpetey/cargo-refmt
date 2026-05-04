@@ -19,11 +19,35 @@ struct Args {
     paths: Vec<PathBuf>,
 }
 
+#[derive(Clone)]
+struct BucketItem {
+    sort_key: String,
+    snippet: String,
+}
+
 struct ImplSnippet {
     target: Option<String>,
     sort_category: usize,
     source_order: usize,
     snippet: String,
+}
+
+struct TypeDependencyVisitor<'a> {
+    local_types: &'a HashSet<String>,
+    dependencies: HashSet<String>,
+}
+
+impl Visit<'_> for TypeDependencyVisitor<'_> {
+    fn visit_type_path(&mut self, path: &syn::TypePath) {
+        for segment in &path.path.segments {
+            let ident = segment.ident.to_string();
+            if self.local_types.contains(&ident) {
+                self.dependencies.insert(ident);
+            }
+        }
+
+        syn::visit::visit_type_path(self, path);
+    }
 }
 
 fn blank_lines_after(category: usize) -> usize {
@@ -126,6 +150,42 @@ fn collect_directory(
     Ok(())
 }
 
+fn collect_impls_and_bucket_rest(
+    items: Vec<Item>,
+    buckets: &mut [Vec<BucketItem>],
+    src: &str,
+    line_starts: &[usize],
+) -> Vec<ImplSnippet> {
+    let mut impls = Vec::new();
+    let local_traits = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Trait(item) => Some(item.ident.to_string()),
+            Item::TraitAlias(item) => Some(item.ident.to_string()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+
+    for (source_order, item) in items.into_iter().enumerate() {
+        if let Item::Impl(impl_item) = &item {
+            impls.push(ImplSnippet {
+                target: impl_type_name(impl_item),
+                sort_category: impl_sort_category(impl_item, &local_traits),
+                source_order,
+                snippet: item_snippet(&item, src, line_starts),
+            });
+        } else {
+            let cat = category(&item);
+            buckets[cat].push(BucketItem {
+                sort_key: item_sort_key(&item),
+                snippet: item_snippet(&item, src, line_starts),
+            });
+        }
+    }
+
+    impls
+}
+
 fn collect_input_files(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let mut seen = HashSet::new();
@@ -152,6 +212,30 @@ fn collect_path(path: &Path, files: &mut Vec<PathBuf>, seen: &mut HashSet<PathBu
     }
 
     Ok(())
+}
+
+fn collect_type_item_dependencies(item: &Item, local_types: &HashSet<String>) -> HashSet<String> {
+    let mut visitor = TypeDependencyVisitor {
+        local_types,
+        dependencies: HashSet::new(),
+    };
+
+    match item {
+        Item::Struct(item) => visitor.visit_fields(&item.fields),
+        Item::Enum(item) => {
+            for variant in &item.variants {
+                visitor.visit_fields(&variant.fields);
+            }
+        }
+        Item::Union(item) => visitor.visit_fields_named(&item.fields),
+        _ => {}
+    }
+
+    if let Some(name) = item_name(item) {
+        visitor.dependencies.remove(&name);
+    }
+
+    visitor.dependencies
 }
 
 fn contains_test(expr: &syn::Expr) -> bool {
@@ -232,10 +316,6 @@ fn impl_sort_category(impl_item: &syn::ItemImpl, local_traits: &HashSet<String>)
     }
 }
 
-fn impl_type_name(impl_item: &syn::ItemImpl) -> Option<String> {
-    type_key(&impl_item.self_ty)
-}
-
 fn impl_target_matches_type(target: Option<&str>, type_name: &str) -> bool {
     let Some(target) = target else {
         return false;
@@ -248,6 +328,17 @@ fn impl_target_matches_type(target: Option<&str>, type_name: &str) -> bool {
     let segments = target.split("::").collect::<Vec<_>>();
     matches!(segments.first(), Some(&"crate" | &"self" | &"super"))
         && segments.last().is_some_and(|segment| *segment == type_name)
+}
+
+fn impl_type_name(impl_item: &syn::ItemImpl) -> Option<String> {
+    type_key(&impl_item.self_ty)
+}
+
+fn is_rust_file(path: &Path) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) => ext.eq_ignore_ascii_case("rs"),
+        None => false,
+    }
 }
 
 fn is_rust_trait(trait_path: &syn::Path, local_traits: &HashSet<String>) -> bool {
@@ -309,36 +400,6 @@ fn is_rust_trait(trait_path: &syn::Path, local_traits: &HashSet<String>) -> bool
     })
 }
 
-fn path_key(path: &syn::Path) -> Option<String> {
-    let segments = path
-        .segments
-        .iter()
-        .map(|segment| segment.ident.to_string())
-        .collect::<Vec<_>>();
-    if segments.is_empty() {
-        None
-    } else {
-        Some(segments.join("::"))
-    }
-}
-
-fn type_key(ty: &syn::Type) -> Option<String> {
-    match ty {
-        syn::Type::Group(group) => type_key(&group.elem),
-        syn::Type::Paren(paren) => type_key(&paren.elem),
-        syn::Type::Path(path) => path_key(&path.path),
-        syn::Type::Reference(reference) => type_key(&reference.elem),
-        _ => None,
-    }
-}
-
-fn is_rust_file(path: &Path) -> bool {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) => ext.eq_ignore_ascii_case("rs"),
-        None => false,
-    }
-}
-
 fn is_std_crate(name: &str) -> bool {
     name == "std"
         || name == "core"
@@ -374,6 +435,57 @@ fn item_attributes(item: &Item) -> &[Attribute] {
         Item::Use(item) => &item.attrs,
         Item::Verbatim(_) => &[],
         _ => &[],
+    }
+}
+
+fn item_sort_key(item: &Item) -> String {
+    match item {
+        Item::Use(use_item) => use_path_to_string(&use_item.tree),
+        Item::Mod(mod_item) => mod_item.ident.to_string(),
+        Item::ExternCrate(extern_crate) => extern_crate.ident.to_string(),
+        Item::Type(type_item) => type_item.ident.to_string(),
+        Item::Const(const_item) => const_item.ident.to_string(),
+        Item::Static(static_item) => static_item.ident.to_string(),
+        Item::Trait(trait_item) => trait_item.ident.to_string(),
+        Item::TraitAlias(trait_alias) => trait_alias.ident.to_string(),
+        Item::Struct(struct_item) => struct_item.ident.to_string(),
+        Item::Enum(enum_item) => enum_item.ident.to_string(),
+        Item::Union(union_item) => union_item.ident.to_string(),
+        Item::Impl(impl_item) => impl_type_name(impl_item).unwrap_or_default(),
+        Item::Fn(fn_item) => fn_item.sig.ident.to_string(),
+        Item::ForeignMod(_) => String::new(),
+        Item::Macro(macro_item) => {
+            macro_item
+                .mac
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default()
+        }
+        Item::Verbatim(_) => String::new(),
+        _ => String::new(),
+    }
+}
+
+fn use_path_to_string(tree: &syn::UseTree) -> String {
+    match tree {
+        syn::UseTree::Path(path) => {
+            let rest = use_path_to_string(&path.tree);
+            if rest.is_empty() {
+                path.ident.to_string()
+            } else {
+                format!("{}::{}", path.ident, rest)
+            }
+        }
+        syn::UseTree::Name(name) => name.ident.to_string(),
+        syn::UseTree::Rename(rename) => rename.ident.to_string(),
+        syn::UseTree::Glob(_) => "*".to_string(),
+        syn::UseTree::Group(group) => {
+            let mut paths: Vec<_> = group.items.iter().map(use_path_to_string).collect();
+            paths.sort();
+            paths.join(", ")
+        }
     }
 }
 
@@ -438,85 +550,155 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn path_key(path: &syn::Path) -> Option<String> {
+    let segments = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments.join("::"))
+    }
+}
+
 fn push_file(path: PathBuf, files: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>) {
     if seen.insert(path.clone()) {
         files.push(path);
     }
 }
 
-fn collect_impls_and_bucket_rest(
+fn push_ordered_impls(impls: Vec<ImplSnippet>, type_order: &[String], bucket: &mut Vec<BucketItem>) {
+    let mut used_impls = vec![false; impls.len()];
+
+    for type_name in type_order {
+        let mut matching_impls = impls
+            .iter()
+            .enumerate()
+            .filter(|(_, impl_item)| {
+                impl_target_matches_type(impl_item.target.as_deref(), type_name)
+            })
+            .collect::<Vec<_>>();
+        matching_impls
+            .sort_by_key(|(_, impl_item)| (impl_item.sort_category, impl_item.source_order));
+
+        for (index, impl_item) in matching_impls {
+            used_impls[index] = true;
+            bucket.push(BucketItem {
+                sort_key: impl_item.target.clone().unwrap_or_default(),
+                snippet: impl_item.snippet.clone(),
+            });
+        }
+    }
+
+    for (index, impl_item) in impls.into_iter().enumerate() {
+        if !used_impls[index] {
+            bucket.push(BucketItem {
+                sort_key: impl_item.target.unwrap_or_default(),
+                snippet: impl_item.snippet,
+            });
+        }
+    }
+}
+
+fn push_type_items(
     items: Vec<Item>,
-    buckets: &mut [Vec<String>],
+    buckets: &mut [Vec<BucketItem>],
     src: &str,
     line_starts: &[usize],
-) -> Vec<ImplSnippet> {
-    let mut impls = Vec::new();
-    let local_traits = items
+) {
+    for item in items {
+        buckets[9].push(BucketItem {
+            sort_key: item_sort_key(&item),
+            snippet: item_snippet(&item, src, line_starts),
+        });
+    }
+}
+
+fn reorder_file(path: &Path) -> Result<()> {
+    let src = fs::read_to_string(path).with_context(|| format!("read file {}", path.display()))?;
+    let mut file: File =
+        syn::parse_file(&src).with_context(|| format!("parse {}", path.display()))?;
+    let line_starts = line_start_offsets(&src);
+
+    let shebang = file.shebang.take();
+    let crate_attrs = std::mem::take(&mut file.attrs);
+
+    let (struct_enum_items, rest_items): (Vec<_>, Vec<_>) = file
+        .items
+        .into_iter()
+        .partition(|item| matches!(item, Item::Struct(_) | Item::Enum(_) | Item::Union(_)));
+
+    let (fn_items, other_items): (Vec<_>, Vec<_>) = rest_items
+        .into_iter()
+        .partition(|item| matches!(item, Item::Fn(_)));
+
+    let sorted_struct_enums = sort_type_items_by_dependencies(struct_enum_items);
+
+    let mut sorted_fn_items = fn_items;
+    sorted_fn_items.sort_by(|a, b| {
+        fn_visibility_rank(a)
+            .cmp(&fn_visibility_rank(b))
+            .then_with(|| fn_item_name(a).cmp(&fn_item_name(b)))
+    });
+
+    let mut buckets: Vec<Vec<BucketItem>> = (0..14).map(|_| Vec::new()).collect();
+
+    let impl_items = collect_impls_and_bucket_rest(other_items, &mut buckets, &src, &line_starts);
+
+    let type_order: Vec<String> = sorted_struct_enums
         .iter()
-        .filter_map(|item| match item {
-            Item::Trait(item) => Some(item.ident.to_string()),
-            Item::TraitAlias(item) => Some(item.ident.to_string()),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
+        .filter_map(|item| item_name(item))
+        .collect();
 
-    for (source_order, item) in items.into_iter().enumerate() {
-        if let Item::Impl(impl_item) = &item {
-            impls.push(ImplSnippet {
-                target: impl_type_name(impl_item),
-                sort_category: impl_sort_category(impl_item, &local_traits),
-                source_order,
-                snippet: item_snippet(&item, src, line_starts),
-            });
-        } else {
-            let cat = category(&item);
-            buckets[cat].push(item_snippet(&item, src, line_starts));
+    push_type_items(sorted_struct_enums, &mut buckets, &src, &line_starts);
+    push_ordered_impls(impl_items, &type_order, &mut buckets[10]);
+
+    for item in sorted_fn_items.into_iter() {
+        let snippet = item_snippet(&item, &src, &line_starts);
+        buckets[11].push(BucketItem {
+            sort_key: item_sort_key(&item),
+            snippet,
+        });
+    }
+
+    let mut out = String::new();
+    if let Some(sb) = shebang {
+        out.push_str(&sb);
+        out.push('\n');
+    }
+    if !crate_attrs.is_empty() {
+        let header = header_to_string(&crate_attrs, &src, &line_starts);
+        out.push_str(header.trim_end());
+        out.push_str("\n\n");
+    }
+
+    let mut wrote_any = !out.is_empty();
+
+    let order = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 10, 11, 12];
+    for idx in order {
+        if let Some(bucket) = buckets.get_mut(idx) {
+            write_bucket(&mut out, bucket, idx, &mut wrote_any);
         }
     }
 
-    impls
-}
-
-struct TypeDependencyVisitor<'a> {
-    local_types: &'a HashSet<String>,
-    dependencies: HashSet<String>,
-}
-
-impl Visit<'_> for TypeDependencyVisitor<'_> {
-    fn visit_type_path(&mut self, path: &syn::TypePath) {
-        for segment in &path.path.segments {
-            let ident = segment.ident.to_string();
-            if self.local_types.contains(&ident) {
-                self.dependencies.insert(ident);
-            }
-        }
-
-        syn::visit::visit_type_path(self, path);
+    while out.ends_with("\n\n\n") {
+        out.pop();
     }
-}
-
-fn collect_type_item_dependencies(item: &Item, local_types: &HashSet<String>) -> HashSet<String> {
-    let mut visitor = TypeDependencyVisitor {
-        local_types,
-        dependencies: HashSet::new(),
-    };
-
-    match item {
-        Item::Struct(item) => visitor.visit_fields(&item.fields),
-        Item::Enum(item) => {
-            for variant in &item.variants {
-                visitor.visit_fields(&variant.fields);
-            }
-        }
-        Item::Union(item) => visitor.visit_fields_named(&item.fields),
-        _ => {}
+    let src_has_trailing_newline = src.ends_with('\n');
+    let out_has_trailing_newline = out.ends_with('\n');
+    if src_has_trailing_newline && !out_has_trailing_newline {
+        out.push('\n');
+    } else if !src_has_trailing_newline && out_has_trailing_newline {
+        out.pop();
     }
 
-    if let Some(name) = item_name(item) {
-        visitor.dependencies.remove(&name);
+    if out != src {
+        fs::write(path, out)?;
     }
 
-    visitor.dependencies
+    Ok(())
 }
 
 fn sort_type_items_by_dependencies(items: Vec<Item>) -> Vec<Item> {
@@ -561,157 +743,6 @@ fn sort_type_items_by_dependencies(items: Vec<Item>) -> Vec<Item> {
     sorted
 }
 
-fn push_ordered_impls(impls: Vec<ImplSnippet>, type_order: &[String], bucket: &mut Vec<String>) {
-    let mut used_impls = vec![false; impls.len()];
-
-    for type_name in type_order {
-        let mut matching_impls = impls
-            .iter()
-            .enumerate()
-            .filter(|(_, impl_item)| {
-                impl_target_matches_type(impl_item.target.as_deref(), type_name)
-            })
-            .collect::<Vec<_>>();
-        matching_impls
-            .sort_by_key(|(_, impl_item)| (impl_item.sort_category, impl_item.source_order));
-
-        for (index, impl_item) in matching_impls {
-            used_impls[index] = true;
-            bucket.push(impl_item.snippet.clone());
-        }
-    }
-
-    for (index, impl_item) in impls.into_iter().enumerate() {
-        if !used_impls[index] {
-            bucket.push(impl_item.snippet);
-        }
-    }
-}
-
-fn push_type_items(
-    items: Vec<Item>,
-    buckets: &mut [Vec<String>],
-    src: &str,
-    line_starts: &[usize],
-) {
-    for item in items {
-        buckets[9].push(item_snippet(&item, src, line_starts));
-    }
-}
-
-fn write_bucket(out: &mut String, bucket: &mut Vec<String>, category: usize, wrote_any: &mut bool) {
-    if bucket.is_empty() {
-        return;
-    }
-
-    if category == 9 || category == 10 || category == 13 {
-        // These buckets carry their semantic order from earlier grouping.
-    } else if category != 11 {
-        bucket.sort();
-    }
-
-    if *wrote_any && category != 0 {
-        while !out.ends_with("\n\n") {
-            out.push('\n');
-        }
-    }
-    *wrote_any = true;
-
-    let extra_blank = blank_lines_after(category);
-    let bucket_len = bucket.len();
-    for (i, item) in bucket.drain(..).enumerate() {
-        out.push_str(item.trim_end_matches('\n'));
-        out.push('\n');
-        if i + 1 < bucket_len {
-            for _ in 0..extra_blank {
-                out.push('\n');
-            }
-        }
-    }
-}
-
-fn reorder_file(path: &Path) -> Result<()> {
-    let src = fs::read_to_string(path).with_context(|| format!("read file {}", path.display()))?;
-    let mut file: File =
-        syn::parse_file(&src).with_context(|| format!("parse {}", path.display()))?;
-    let line_starts = line_start_offsets(&src);
-
-    let shebang = file.shebang.take();
-    let crate_attrs = std::mem::take(&mut file.attrs);
-
-    let (struct_enum_items, rest_items): (Vec<_>, Vec<_>) = file
-        .items
-        .into_iter()
-        .partition(|item| matches!(item, Item::Struct(_) | Item::Enum(_) | Item::Union(_)));
-
-    let (fn_items, other_items): (Vec<_>, Vec<_>) = rest_items
-        .into_iter()
-        .partition(|item| matches!(item, Item::Fn(_)));
-
-    let sorted_struct_enums = sort_type_items_by_dependencies(struct_enum_items);
-
-    let mut sorted_fn_items = fn_items;
-    sorted_fn_items.sort_by(|a, b| {
-        fn_visibility_rank(a)
-            .cmp(&fn_visibility_rank(b))
-            .then_with(|| fn_item_name(a).cmp(&fn_item_name(b)))
-    });
-
-    let mut buckets: Vec<Vec<String>> = vec![Vec::new(); 14];
-
-    let impl_items = collect_impls_and_bucket_rest(other_items, &mut buckets, &src, &line_starts);
-
-    let type_order: Vec<String> = sorted_struct_enums
-        .iter()
-        .filter_map(|item| item_name(item))
-        .collect();
-
-    push_type_items(sorted_struct_enums, &mut buckets, &src, &line_starts);
-    push_ordered_impls(impl_items, &type_order, &mut buckets[10]);
-
-    for item in sorted_fn_items.into_iter() {
-        let snippet = item_snippet(&item, &src, &line_starts);
-        buckets[11].push(snippet);
-    }
-
-    let mut out = String::new();
-    if let Some(sb) = shebang {
-        out.push_str(&sb);
-        out.push('\n');
-    }
-    if !crate_attrs.is_empty() {
-        let header = header_to_string(&crate_attrs, &src, &line_starts);
-        out.push_str(header.trim_end());
-        out.push_str("\n\n");
-    }
-
-    let mut wrote_any = !out.is_empty();
-
-    let order = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 10, 11, 12];
-    for idx in order {
-        if let Some(bucket) = buckets.get_mut(idx) {
-            write_bucket(&mut out, bucket, idx, &mut wrote_any);
-        }
-    }
-
-    while out.ends_with("\n\n\n") {
-        out.pop();
-    }
-    let src_has_trailing_newline = src.ends_with('\n');
-    let out_has_trailing_newline = out.ends_with('\n');
-    if src_has_trailing_newline && !out_has_trailing_newline {
-        out.push('\n');
-    } else if !src_has_trailing_newline && out_has_trailing_newline {
-        out.pop();
-    }
-
-    if out != src {
-        fs::write(path, out)?;
-    }
-
-    Ok(())
-}
-
 fn span_range(
     span: proc_macro2::Span,
     line_starts: &[usize],
@@ -746,6 +777,16 @@ fn span_range(
     start_idx..end_idx
 }
 
+fn type_key(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Group(group) => type_key(&group.elem),
+        syn::Type::Paren(paren) => type_key(&paren.elem),
+        syn::Type::Path(path) => path_key(&path.path),
+        syn::Type::Reference(reference) => type_key(&reference.elem),
+        _ => None,
+    }
+}
+
 fn use_category(use_item: &syn::ItemUse) -> Cat {
     fn get_first_ident(tree: &syn::UseTree) -> Option<&syn::Ident> {
         match tree {
@@ -768,6 +809,37 @@ fn use_category(use_item: &syn::ItemUse) -> Cat {
         return 0;
     }
     1
+}
+
+fn write_bucket(out: &mut String, bucket: &mut Vec<BucketItem>, category: usize, wrote_any: &mut bool) {
+    if bucket.is_empty() {
+        return;
+    }
+
+    if category == 9 || category == 10 || category == 13 {
+        // These buckets carry their semantic order from earlier grouping.
+    } else if category != 11 {
+        bucket.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+    }
+
+    if *wrote_any && category != 0 {
+        while !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+    }
+    *wrote_any = true;
+
+    let extra_blank = blank_lines_after(category);
+    let bucket_len = bucket.len();
+    for (i, item) in bucket.drain(..).enumerate() {
+        out.push_str(item.snippet.trim_end_matches('\n'));
+        out.push('\n');
+        if i + 1 < bucket_len {
+            for _ in 0..extra_blank {
+                out.push('\n');
+            }
+        }
+    }
 }
 
 #[cfg(test)]
