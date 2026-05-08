@@ -596,15 +596,27 @@ fn merge_use_trees(snippets: &[String]) -> Option<Vec<String>> {
     sorted_roots.sort_by_key(|(root, _)| root.clone());
 
     for (root, subtrees) in sorted_roots {
-        let merged_tree = if subtrees.len() == 1 {
+        let (bare, path_imports): (Vec<_>, Vec<_>) = subtrees
+            .into_iter()
+            .partition(|subtree| use_path_to_string(subtree) == root);
+
+        for bare_tree in bare {
+            result.push(format_use_multi_line(&bare_tree));
+        }
+
+        if path_imports.is_empty() {
+            continue;
+        }
+
+        let merged_tree = if path_imports.len() == 1 {
             syn::UseTree::Path(syn::UsePath {
                 ident: syn::Ident::new(&root, proc_macro2::Span::call_site()),
                 colon2_token: syn::Token![::](proc_macro2::Span::call_site()),
-                tree: Box::new(subtrees.into_iter().next().unwrap()),
+                tree: Box::new(path_imports.into_iter().next().unwrap()),
             })
         } else {
             let mut items: Vec<syn::UseTree> = Vec::new();
-            for subtree in subtrees {
+            for subtree in path_imports {
                 if let syn::UseTree::Group(g) = subtree {
                     items.extend(g.items);
                 } else {
@@ -969,7 +981,7 @@ fn write_bucket(
     let extra_blank = blank_lines_after(category);
     let bucket_len = bucket.len();
 
-    if matches!(category, 0..=3) {
+    if matches!(category, 0..=2) {
         let snippets: Vec<_> = bucket
             .drain(..)
             .map(|item| item.snippet.trim_end_matches('\n').to_string())

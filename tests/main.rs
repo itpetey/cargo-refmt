@@ -174,7 +174,7 @@ const WORKTREE_DIR: &str = \".mmat-worktrees\";
 }
 
 fn test_dir() -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/regression");
+    let dir = std::env::temp_dir().join("cargo-refmt-tests");
     fs::create_dir_all(&dir).expect("failed to create test dir");
     dir
 }
