@@ -51,6 +51,31 @@ impl Visit<'_> for TypeDependencyVisitor<'_> {
     }
 }
 
+fn main() -> Result<()> {
+    let mut raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.len() > 1 && raw_args[1] == "refmt" {
+        raw_args.remove(1);
+    }
+    let args = Args::parse_from(raw_args);
+
+    let paths = if args.paths.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        args.paths
+    };
+
+    let files = collect_input_files(paths)?;
+
+    for path in files {
+        reorder_file(&path).with_context(|| format!("refmt {}", path.display()))?;
+    }
+
+    // Run `cargo fmt` last to catch any outstanding formatting issues
+    Command::new("cargo").arg("fmt").status()?;
+
+    Ok(())
+}
+
 fn blank_lines_after(category: usize) -> usize {
     match category {
         0..=7 => 0,
@@ -547,31 +572,6 @@ fn line_start_offsets(src: &str) -> Vec<usize> {
         starts.push(src.len());
     }
     starts
-}
-
-fn main() -> Result<()> {
-    let mut raw_args: Vec<String> = std::env::args().collect();
-    if raw_args.len() > 1 && raw_args[1] == "refmt" {
-        raw_args.remove(1);
-    }
-    let args = Args::parse_from(raw_args);
-
-    let paths = if args.paths.is_empty() {
-        vec![PathBuf::from(".")]
-    } else {
-        args.paths
-    };
-
-    let files = collect_input_files(paths)?;
-
-    for path in files {
-        reorder_file(&path).with_context(|| format!("refmt {}", path.display()))?;
-    }
-
-    // Run `cargo fmt` last to catch any outstanding formatting issues
-    Command::new("cargo").arg("fmt").status()?;
-
-    Ok(())
 }
 
 fn merge_use_trees(snippets: &[String]) -> Option<Vec<String>> {
