@@ -1,12 +1,22 @@
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{
+    Context,
+    Result,
+    bail,
+};
 use clap::Parser;
-use syn::spanned::Spanned;
-use syn::visit::Visit;
-use syn::{Attribute, File, Item};
+use syn::{
+    Attribute,
+    File,
+    Item,
+    spanned::Spanned,
+    visit::Visit,
+};
 
 type Cat = usize;
 
@@ -274,6 +284,49 @@ fn fn_visibility_rank(item: &Item) -> u8 {
     }
 }
 
+fn format_use_inline(tree: &syn::UseTree) -> String {
+    match tree {
+        syn::UseTree::Path(path) => {
+            let rest = format_use_inline(&path.tree);
+            format!("{}::{}", path.ident, rest)
+        }
+        syn::UseTree::Name(name) => name.ident.to_string(),
+        syn::UseTree::Rename(rename) => format!("{} as {}", rename.ident, rename.rename),
+        syn::UseTree::Glob(_) => "*".to_string(),
+        syn::UseTree::Group(group) => {
+            let items: Vec<_> = group.items.iter().map(format_use_inline).collect();
+            format!("{{{}}}", items.join(", "))
+        }
+    }
+}
+
+fn format_use_multi_line(tree: &syn::UseTree) -> String {
+    match tree {
+        syn::UseTree::Path(path) => {
+            if let syn::UseTree::Group(group) = &*path.tree {
+                let mut inner = format!("{}::{{\n", path.ident);
+                for item in &group.items {
+                    inner.push_str("    ");
+                    inner.push_str(&format_use_inline(item));
+                    inner.push_str(",\n");
+                }
+                inner.push('}');
+                inner
+            } else {
+                let rest = format_use_multi_line(&path.tree);
+                format!("{}::{}", path.ident, rest)
+            }
+        }
+        syn::UseTree::Name(name) => name.ident.to_string(),
+        syn::UseTree::Rename(rename) => format!("{} as {}", rename.ident, rename.rename),
+        syn::UseTree::Glob(_) => "*".to_string(),
+        syn::UseTree::Group(group) => {
+            let items: Vec<_> = group.items.iter().map(format_use_inline).collect();
+            format!("{{{}}}", items.join(", "))
+        }
+    }
+}
+
 fn has_cfg_test(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| {
         if !attr.path().is_ident("cfg") {
@@ -438,6 +491,30 @@ fn item_attributes(item: &Item) -> &[Attribute] {
     }
 }
 
+fn item_name(item: &Item) -> Option<String> {
+    match item {
+        Item::Struct(s) => Some(s.ident.to_string()),
+        Item::Enum(e) => Some(e.ident.to_string()),
+        Item::Union(u) => Some(u.ident.to_string()),
+        _ => None,
+    }
+}
+
+fn item_snippet(item: &Item, src: &str, line_starts: &[usize]) -> String {
+    let mut range = span_range(item.span(), line_starts, src.len());
+
+    for attr in item_attributes(item) {
+        let attr_range = span_range(attr.span(), line_starts, src.len());
+        if attr_range.start < range.start {
+            range.start = attr_range.start;
+        }
+    }
+
+    range.start = range.start.min(range.end);
+
+    src[range].trim_end().to_string()
+}
+
 fn item_sort_key(item: &Item) -> String {
     match item {
         Item::Use(use_item) => use_path_to_string(&use_item.tree),
@@ -468,14 +545,41 @@ fn item_sort_key(item: &Item) -> String {
     }
 }
 
-fn use_tree_root(tree: &syn::UseTree) -> Option<String> {
-    match tree {
-        syn::UseTree::Path(path) => Some(path.ident.to_string()),
-        syn::UseTree::Name(name) => Some(name.ident.to_string()),
-        syn::UseTree::Rename(rename) => Some(rename.ident.to_string()),
-        syn::UseTree::Group(group) => group.items.first().and_then(use_tree_root),
-        syn::UseTree::Glob(_) => None,
+fn line_start_offsets(src: &str) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(src.len() / 32 + 2);
+    starts.push(0);
+    for (idx, ch) in src.char_indices() {
+        if ch == '\n' {
+            let next = idx + ch.len_utf8();
+            starts.push(next);
+        }
     }
+    if *starts.last().unwrap_or(&0) != src.len() {
+        starts.push(src.len());
+    }
+    starts
+}
+
+fn main() -> Result<()> {
+    let mut raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.len() > 1 && raw_args[1] == "refmt" {
+        raw_args.remove(1);
+    }
+    let args = Args::parse_from(raw_args);
+
+    let paths = if args.paths.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        args.paths
+    };
+
+    let files = collect_input_files(paths)?;
+
+    for path in files {
+        reorder_file(&path).with_context(|| format!("refmt {}", path.display()))?;
+    }
+
+    Ok(())
 }
 
 fn merge_use_trees(snippets: &[String]) -> Option<Vec<String>> {
@@ -534,131 +638,6 @@ fn merge_use_trees(snippets: &[String]) -> Option<Vec<String>> {
     }
 
     Some(result)
-}
-
-fn format_use_multi_line(tree: &syn::UseTree) -> String {
-    match tree {
-        syn::UseTree::Path(path) => {
-            if let syn::UseTree::Group(group) = &*path.tree {
-                let mut inner = format!("{}::{{\n", path.ident);
-                for item in &group.items {
-                    inner.push_str("    ");
-                    inner.push_str(&format_use_inline(item));
-                    inner.push_str(",\n");
-                }
-                inner.push('}');
-                inner
-            } else {
-                let rest = format_use_multi_line(&path.tree);
-                format!("{}::{}", path.ident, rest)
-            }
-        }
-        syn::UseTree::Name(name) => name.ident.to_string(),
-        syn::UseTree::Rename(rename) => format!("{} as {}", rename.ident, rename.rename),
-        syn::UseTree::Glob(_) => "*".to_string(),
-        syn::UseTree::Group(group) => {
-            let items: Vec<_> = group.items.iter().map(format_use_inline).collect();
-            format!("{{{}}}", items.join(", "))
-        }
-    }
-}
-
-fn format_use_inline(tree: &syn::UseTree) -> String {
-    match tree {
-        syn::UseTree::Path(path) => {
-            let rest = format_use_inline(&path.tree);
-            format!("{}::{}", path.ident, rest)
-        }
-        syn::UseTree::Name(name) => name.ident.to_string(),
-        syn::UseTree::Rename(rename) => format!("{} as {}", rename.ident, rename.rename),
-        syn::UseTree::Glob(_) => "*".to_string(),
-        syn::UseTree::Group(group) => {
-            let items: Vec<_> = group.items.iter().map(format_use_inline).collect();
-            format!("{{{}}}", items.join(", "))
-        }
-    }
-}
-
-fn use_path_to_string(tree: &syn::UseTree) -> String {
-    match tree {
-        syn::UseTree::Path(path) => {
-            let rest = use_path_to_string(&path.tree);
-            if rest.is_empty() {
-                path.ident.to_string()
-            } else {
-                format!("{}::{}", path.ident, rest)
-            }
-        }
-        syn::UseTree::Name(name) => name.ident.to_string(),
-        syn::UseTree::Rename(rename) => rename.ident.to_string(),
-        syn::UseTree::Glob(_) => "*".to_string(),
-        syn::UseTree::Group(group) => {
-            let mut paths: Vec<_> = group.items.iter().map(use_path_to_string).collect();
-            paths.sort();
-            paths.join(", ")
-        }
-    }
-}
-
-fn item_name(item: &Item) -> Option<String> {
-    match item {
-        Item::Struct(s) => Some(s.ident.to_string()),
-        Item::Enum(e) => Some(e.ident.to_string()),
-        Item::Union(u) => Some(u.ident.to_string()),
-        _ => None,
-    }
-}
-
-fn item_snippet(item: &Item, src: &str, line_starts: &[usize]) -> String {
-    let mut range = span_range(item.span(), line_starts, src.len());
-
-    for attr in item_attributes(item) {
-        let attr_range = span_range(attr.span(), line_starts, src.len());
-        if attr_range.start < range.start {
-            range.start = attr_range.start;
-        }
-    }
-
-    range.start = range.start.min(range.end);
-
-    src[range].trim_end().to_string()
-}
-
-fn line_start_offsets(src: &str) -> Vec<usize> {
-    let mut starts = Vec::with_capacity(src.len() / 32 + 2);
-    starts.push(0);
-    for (idx, ch) in src.char_indices() {
-        if ch == '\n' {
-            let next = idx + ch.len_utf8();
-            starts.push(next);
-        }
-    }
-    if *starts.last().unwrap_or(&0) != src.len() {
-        starts.push(src.len());
-    }
-    starts
-}
-
-fn main() -> Result<()> {
-    let mut raw_args: Vec<String> = std::env::args().collect();
-    if raw_args.len() > 1 && raw_args[1] == "refmt" {
-        raw_args.remove(1);
-    }
-    let args = Args::parse_from(raw_args);
-
-    let paths = if args.paths.is_empty() {
-        vec![PathBuf::from(".")]
-    } else {
-        args.paths
-    };
-
-    let files = collect_input_files(paths)?;
-
-    for path in files {
-        reorder_file(&path).with_context(|| format!("refmt {}", path.display()))?;
-    }
-
-    Ok(())
 }
 
 fn path_key(path: &syn::Path) -> Option<String> {
@@ -920,6 +899,37 @@ fn use_category(use_item: &syn::ItemUse) -> Cat {
         return 0;
     }
     1
+}
+
+fn use_path_to_string(tree: &syn::UseTree) -> String {
+    match tree {
+        syn::UseTree::Path(path) => {
+            let rest = use_path_to_string(&path.tree);
+            if rest.is_empty() {
+                path.ident.to_string()
+            } else {
+                format!("{}::{}", path.ident, rest)
+            }
+        }
+        syn::UseTree::Name(name) => name.ident.to_string(),
+        syn::UseTree::Rename(rename) => rename.ident.to_string(),
+        syn::UseTree::Glob(_) => "*".to_string(),
+        syn::UseTree::Group(group) => {
+            let mut paths: Vec<_> = group.items.iter().map(use_path_to_string).collect();
+            paths.sort();
+            paths.join(", ")
+        }
+    }
+}
+
+fn use_tree_root(tree: &syn::UseTree) -> Option<String> {
+    match tree {
+        syn::UseTree::Path(path) => Some(path.ident.to_string()),
+        syn::UseTree::Name(name) => Some(name.ident.to_string()),
+        syn::UseTree::Rename(rename) => Some(rename.ident.to_string()),
+        syn::UseTree::Group(group) => group.items.first().and_then(use_tree_root),
+        syn::UseTree::Glob(_) => None,
+    }
 }
 
 fn write_bucket(out: &mut String, bucket: &mut Vec<BucketItem>, category: usize, wrote_any: &mut bool) {

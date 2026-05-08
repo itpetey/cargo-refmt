@@ -1,6 +1,8 @@
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn cargo_bin() -> std::path::PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -54,6 +56,39 @@ pub fn run() {}
 }
 
 #[test]
+fn test_cfg_test_module_at_bottom() {
+    let path = test_dir().join("cfg_test_module.rs");
+    fs::write(
+        &path,
+        "\
+#[cfg(test)]
+mod tests {
+    use super::*;
+}
+
+use std::fs;
+
+pub fn run() {}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    let use_pos = result.find("use std::fs").expect("use not found");
+    let fn_pos = result.find("pub fn run").expect("fn not found");
+    let test_pos = result.find("#[cfg(test)]").expect("#[cfg(test)] not found");
+    assert!(
+        test_pos > use_pos,
+        "#[cfg(test)] mod should be after use at {use_pos}, got test at {test_pos}"
+    );
+    assert!(
+        test_pos > fn_pos,
+        "#[cfg(test)] mod should be after fn at {fn_pos}, got test at {test_pos}"
+    );
+}
+
+#[test]
 fn test_compress_use_statements() {
     let path = test_dir().join("compress_uses.rs");
     fs::write(
@@ -100,39 +135,6 @@ use std::fs::File;
     let result = run_reorder(&path);
 
     assert_eq!(result, "use std::fs::File;\n");
-}
-
-#[test]
-fn test_cfg_test_module_at_bottom() {
-    let path = test_dir().join("cfg_test_module.rs");
-    fs::write(
-        &path,
-        "\
-#[cfg(test)]
-mod tests {
-    use super::*;
-}
-
-use std::fs;
-
-pub fn run() {}
-",
-    )
-    .expect("failed to write test file");
-
-    let result = run_reorder(&path);
-
-    let use_pos = result.find("use std::fs").expect("use not found");
-    let fn_pos = result.find("pub fn run").expect("fn not found");
-    let test_pos = result.find("#[cfg(test)]").expect("#[cfg(test)] not found");
-    assert!(
-        test_pos > use_pos,
-        "#[cfg(test)] mod should be after use at {use_pos}, got test at {test_pos}"
-    );
-    assert!(
-        test_pos > fn_pos,
-        "#[cfg(test)] mod should be after fn at {fn_pos}, got test at {test_pos}"
-    );
 }
 
 #[test]
