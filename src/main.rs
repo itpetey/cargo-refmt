@@ -2,21 +2,12 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
-use anyhow::{
-    Context,
-    Result,
-    bail,
-};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
-use syn::{
-    Attribute,
-    File,
-    Item,
-    spanned::Spanned,
-    visit::Visit,
-};
+use syn::{Attribute, File, Item, spanned::Spanned, visit::Visit};
 
 type Cat = usize;
 
@@ -531,15 +522,13 @@ fn item_sort_key(item: &Item) -> String {
         Item::Impl(impl_item) => impl_type_name(impl_item).unwrap_or_default(),
         Item::Fn(fn_item) => fn_item.sig.ident.to_string(),
         Item::ForeignMod(_) => String::new(),
-        Item::Macro(macro_item) => {
-            macro_item
-                .mac
-                .path
-                .segments
-                .last()
-                .map(|s| s.ident.to_string())
-                .unwrap_or_default()
-        }
+        Item::Macro(macro_item) => macro_item
+            .mac
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default(),
         Item::Verbatim(_) => String::new(),
         _ => String::new(),
     }
@@ -578,6 +567,9 @@ fn main() -> Result<()> {
     for path in files {
         reorder_file(&path).with_context(|| format!("refmt {}", path.display()))?;
     }
+
+    // Run `cargo fmt` last to catch any outstanding formatting issues
+    Command::new("cargo").arg("fmt").status()?;
 
     Ok(())
 }
@@ -659,7 +651,11 @@ fn push_file(path: PathBuf, files: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf
     }
 }
 
-fn push_ordered_impls(impls: Vec<ImplSnippet>, type_order: &[String], bucket: &mut Vec<BucketItem>) {
+fn push_ordered_impls(
+    impls: Vec<ImplSnippet>,
+    type_order: &[String],
+    bucket: &mut Vec<BucketItem>,
+) {
     let mut used_impls = vec![false; impls.len()];
 
     for type_name in type_order {
@@ -932,7 +928,12 @@ fn use_tree_root(tree: &syn::UseTree) -> Option<String> {
     }
 }
 
-fn write_bucket(out: &mut String, bucket: &mut Vec<BucketItem>, category: usize, wrote_any: &mut bool) {
+fn write_bucket(
+    out: &mut String,
+    bucket: &mut Vec<BucketItem>,
+    category: usize,
+    wrote_any: &mut bool,
+) {
     if bucket.is_empty() {
         return;
     }
