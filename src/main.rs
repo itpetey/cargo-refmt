@@ -722,8 +722,23 @@ fn reorder_file(path: &Path) -> Result<()> {
 
     let sorted_struct_enums = sort_type_items_by_dependencies(struct_enum_items);
 
+    let is_main_rs = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "main.rs");
+
     let mut sorted_fn_items = fn_items;
     sorted_fn_items.sort_by(|a, b| {
+        if is_main_rs {
+            let a_is_main = fn_item_name(a) == "main";
+            let b_is_main = fn_item_name(b) == "main";
+            if a_is_main && !b_is_main {
+                return std::cmp::Ordering::Less;
+            }
+            if !a_is_main && b_is_main {
+                return std::cmp::Ordering::Greater;
+            }
+        }
         fn_visibility_rank(a)
             .cmp(&fn_visibility_rank(b))
             .then_with(|| fn_item_name(a).cmp(&fn_item_name(b)))

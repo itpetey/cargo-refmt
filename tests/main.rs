@@ -180,6 +180,52 @@ fn test_dir() -> PathBuf {
 }
 
 #[test]
+fn test_fn_main_first_in_main_rs() {
+    let path = test_dir().join("main.rs");
+    fs::write(
+        &path,
+        "\
+fn helper() {}
+
+fn main() {}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    let main_pos = result.find("fn main()").expect("fn main not found");
+    let helper_pos = result.find("fn helper()").expect("fn helper not found");
+    assert!(
+        main_pos < helper_pos,
+        "fn main should be first in main.rs: main at {main_pos}, helper at {helper_pos}"
+    );
+}
+
+#[test]
+fn test_fn_main_not_first_in_non_main_rs() {
+    let path = test_dir().join("fn_non_main.rs");
+    fs::write(
+        &path,
+        "\
+fn helper() {}
+
+fn main() {}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    let main_pos = result.find("fn main()").expect("fn main not found");
+    let helper_pos = result.find("fn helper()").expect("fn helper not found");
+    assert!(
+        main_pos > helper_pos,
+        "fn main should NOT be first in non-main.rs: helper at {helper_pos}, main at {main_pos}"
+    );
+}
+
+#[test]
 fn test_fn_visibility_order() {
     let path = test_dir().join("fn_visibility.rs");
     fs::write(
