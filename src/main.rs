@@ -575,7 +575,7 @@ fn line_start_offsets(src: &str) -> Vec<usize> {
 }
 
 fn merge_use_trees(snippets: &[String]) -> Option<Vec<String>> {
-    let mut roots: HashMap<String, Vec<syn::UseTree>> = HashMap::new();
+    let mut roots: HashMap<String, Vec<(syn::UseTree, bool)>> = HashMap::new();
 
     for snippet in snippets {
         let file = syn::parse_file(snippet).ok()?;
@@ -584,11 +584,12 @@ fn merge_use_trees(snippets: &[String]) -> Option<Vec<String>> {
             return None;
         };
         let root = use_tree_root(&use_item.tree)?;
+        let is_bare = !matches!(use_item.tree, syn::UseTree::Path(_));
         let rest = match use_item.tree {
             syn::UseTree::Path(path) => *path.tree,
             other => other,
         };
-        roots.entry(root).or_default().push(rest);
+        roots.entry(root).or_default().push((rest, is_bare));
     }
 
     let mut result = Vec::new();
@@ -596,27 +597,28 @@ fn merge_use_trees(snippets: &[String]) -> Option<Vec<String>> {
     sorted_roots.sort_by_key(|(root, _)| root.clone());
 
     for (root, subtrees) in sorted_roots {
-        let (bare, path_imports): (Vec<_>, Vec<_>) = subtrees
-            .into_iter()
-            .partition(|subtree| use_path_to_string(subtree) == root);
+        let (bare, path_imports): (Vec<_>, Vec<_>) =
+            subtrees.into_iter().partition(|(_, is_bare)| *is_bare);
 
-        for bare_tree in bare {
+        for (bare_tree, _) in bare {
             result.push(format_use_multi_line(&bare_tree));
         }
 
-        if path_imports.is_empty() {
+        let path_trees: Vec<syn::UseTree> = path_imports.into_iter().map(|(t, _)| t).collect();
+
+        if path_trees.is_empty() {
             continue;
         }
 
-        let merged_tree = if path_imports.len() == 1 {
+        let merged_tree = if path_trees.len() == 1 {
             syn::UseTree::Path(syn::UsePath {
                 ident: syn::Ident::new(&root, proc_macro2::Span::call_site()),
                 colon2_token: syn::Token![::](proc_macro2::Span::call_site()),
-                tree: Box::new(path_imports.into_iter().next().unwrap()),
+                tree: Box::new(path_trees.into_iter().next().unwrap()),
             })
         } else {
             let mut items: Vec<syn::UseTree> = Vec::new();
-            for subtree in path_imports {
+            for subtree in path_trees {
                 if let syn::UseTree::Group(g) = subtree {
                     items.extend(g.items);
                 } else {
