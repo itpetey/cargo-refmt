@@ -1,5 +1,7 @@
-use std::fs;
-use std::path::Path;
+use std::{
+    fs,
+    path::Path,
+};
 
 mod context;
 mod ids;

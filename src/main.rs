@@ -468,6 +468,117 @@ fn item_sort_key(item: &Item) -> String {
     }
 }
 
+fn use_tree_root(tree: &syn::UseTree) -> Option<String> {
+    match tree {
+        syn::UseTree::Path(path) => Some(path.ident.to_string()),
+        syn::UseTree::Name(name) => Some(name.ident.to_string()),
+        syn::UseTree::Rename(rename) => Some(rename.ident.to_string()),
+        syn::UseTree::Group(group) => group.items.first().and_then(use_tree_root),
+        syn::UseTree::Glob(_) => None,
+    }
+}
+
+fn merge_use_trees(snippets: &[String]) -> Option<Vec<String>> {
+    let mut roots: HashMap<String, Vec<syn::UseTree>> = HashMap::new();
+
+    for snippet in snippets {
+        let file = syn::parse_file(snippet).ok()?;
+        let item = file.items.into_iter().next()?;
+        let Item::Use(use_item) = item else {
+            return None;
+        };
+        let root = use_tree_root(&use_item.tree)?;
+        let rest = match use_item.tree {
+            syn::UseTree::Path(path) => *path.tree,
+            other => other,
+        };
+        roots.entry(root).or_default().push(rest);
+    }
+
+    let mut result = Vec::new();
+    let mut sorted_roots: Vec<_> = roots.into_iter().collect();
+    sorted_roots.sort_by_key(|(root, _)| root.clone());
+
+    for (root, subtrees) in sorted_roots {
+        let merged_tree = if subtrees.len() == 1 {
+            syn::UseTree::Path(syn::UsePath {
+                ident: syn::Ident::new(&root, proc_macro2::Span::call_site()),
+                colon2_token: syn::Token![::](proc_macro2::Span::call_site()),
+                tree: Box::new(subtrees.into_iter().next().unwrap()),
+            })
+        } else {
+            let mut items: Vec<syn::UseTree> = Vec::new();
+            for subtree in subtrees {
+                if let syn::UseTree::Group(g) = subtree {
+                    items.extend(g.items);
+                } else {
+                    items.push(subtree);
+                }
+            }
+            items.sort_by(|a, b| use_path_to_string(a).cmp(&use_path_to_string(b)));
+            let mut punctuated: syn::punctuated::Punctuated<syn::UseTree, syn::Token![,]> =
+                syn::punctuated::Punctuated::new();
+            for item in items {
+                punctuated.push(item);
+            }
+            syn::UseTree::Path(syn::UsePath {
+                ident: syn::Ident::new(&root, proc_macro2::Span::call_site()),
+                colon2_token: syn::Token![::](proc_macro2::Span::call_site()),
+                tree: Box::new(syn::UseTree::Group(syn::UseGroup {
+                    brace_token: syn::token::Brace(proc_macro2::Span::call_site()),
+                    items: punctuated,
+                })),
+            })
+        };
+        result.push(format_use_multi_line(&merged_tree));
+    }
+
+    Some(result)
+}
+
+fn format_use_multi_line(tree: &syn::UseTree) -> String {
+    match tree {
+        syn::UseTree::Path(path) => {
+            if let syn::UseTree::Group(group) = &*path.tree {
+                let mut inner = format!("{}::{{\n", path.ident);
+                for item in &group.items {
+                    inner.push_str("    ");
+                    inner.push_str(&format_use_inline(item));
+                    inner.push_str(",\n");
+                }
+                inner.push('}');
+                inner
+            } else {
+                let rest = format_use_multi_line(&path.tree);
+                format!("{}::{}", path.ident, rest)
+            }
+        }
+        syn::UseTree::Name(name) => name.ident.to_string(),
+        syn::UseTree::Rename(rename) => format!("{} as {}", rename.ident, rename.rename),
+        syn::UseTree::Glob(_) => "*".to_string(),
+        syn::UseTree::Group(group) => {
+            let items: Vec<_> = group.items.iter().map(format_use_inline).collect();
+            format!("{{{}}}", items.join(", "))
+        }
+    }
+}
+
+fn format_use_inline(tree: &syn::UseTree) -> String {
+    match tree {
+        syn::UseTree::Path(path) => {
+            let rest = format_use_inline(&path.tree);
+            format!("{}::{}", path.ident, rest)
+        }
+        syn::UseTree::Name(name) => name.ident.to_string(),
+        syn::UseTree::Rename(rename) => format!("{} as {}", rename.ident, rename.rename),
+        syn::UseTree::Glob(_) => "*".to_string(),
+        syn::UseTree::Group(group) => {
+            let items: Vec<_> = group.items.iter().map(format_use_inline).collect();
+            format!("{{{}}}", items.join(", "))
+        }
+    }
+}
+
 fn use_path_to_string(tree: &syn::UseTree) -> String {
     match tree {
         syn::UseTree::Path(path) => {
@@ -831,12 +942,38 @@ fn write_bucket(out: &mut String, bucket: &mut Vec<BucketItem>, category: usize,
 
     let extra_blank = blank_lines_after(category);
     let bucket_len = bucket.len();
-    for (i, item) in bucket.drain(..).enumerate() {
-        out.push_str(item.snippet.trim_end_matches('\n'));
-        out.push('\n');
-        if i + 1 < bucket_len {
-            for _ in 0..extra_blank {
+
+    if matches!(category, 0..=3) {
+        let snippets: Vec<_> = bucket
+            .drain(..)
+            .map(|item| item.snippet.trim_end_matches('\n').to_string())
+            .collect();
+
+        if let Some(merged) = merge_use_trees(&snippets) {
+            for use_stmt in merged {
+                out.push_str("use ");
+                out.push_str(&use_stmt);
+                out.push_str(";\n");
+            }
+        } else {
+            for (i, snippet) in snippets.iter().enumerate() {
+                out.push_str(snippet);
                 out.push('\n');
+                if i + 1 < snippets.len() {
+                    for _ in 0..extra_blank {
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+    } else {
+        for (i, item) in bucket.drain(..).enumerate() {
+            out.push_str(item.snippet.trim_end_matches('\n'));
+            out.push('\n');
+            if i + 1 < bucket_len {
+                for _ in 0..extra_blank {
+                    out.push('\n');
+                }
             }
         }
     }

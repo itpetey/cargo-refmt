@@ -54,6 +54,55 @@ pub fn run() {}
 }
 
 #[test]
+fn test_compress_use_statements() {
+    let path = test_dir().join("compress_uses.rs");
+    fs::write(
+        &path,
+        "\
+use mmat_memory::qdrant::VectorMemoryBackend;
+use mmat_memory::store::MemoryStore;
+use mmat_memory::types::{Authority, Confidence, DecayPolicy};
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert!(
+        result.contains("use mmat_memory::{"),
+        "use statements should be compressed: {result}"
+    );
+    assert!(
+        result.contains("qdrant::VectorMemoryBackend"),
+        "should contain qdrant path: {result}"
+    );
+    assert!(
+        result.contains("store::MemoryStore"),
+        "should contain store path: {result}"
+    );
+    assert!(
+        result.contains("types::"),
+        "should contain types path: {result}"
+    );
+}
+
+#[test]
+fn test_compress_use_statements_single_item() {
+    let path = test_dir().join("compress_uses_single.rs");
+    fs::write(
+        &path,
+        "\
+use std::fs::File;
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert_eq!(result, "use std::fs::File;\n");
+}
+
+#[test]
 fn test_cfg_test_module_at_bottom() {
     let path = test_dir().join("cfg_test_module.rs");
     fs::write(
@@ -454,7 +503,7 @@ pub fn run() {}
 
     let result = run_reorder(&path);
 
-    let use_pos = result.find("use std::fs").expect("use statement not found");
+    let use_pos = result.find("use std::").expect("use statement not found");
     let mod_pos = result.find("mod context").expect("mod not found");
     let fn_pos = result.find("pub fn run").expect("fn not found");
     assert!(
