@@ -533,6 +533,44 @@ use crate::module::Blah;
 }
 
 #[test]
+fn test_import_ordering_preserves_use_attrs() {
+    let path = test_dir().join("imports_with_attrs.rs");
+    fs::write(
+        &path,
+        "\
+use dioxus::{
+    fullstack::{WebSocketOptions, Websocket},
+    prelude::*,
+};
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = \"server\")]
+use std::sync::OnceLock;
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert_eq!(
+        result,
+        "\
+#[cfg(feature = \"server\")]
+use std::sync::OnceLock;
+
+use dioxus::{
+    fullstack::{WebSocketOptions, Websocket},
+    prelude::*,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+"
+    );
+}
+
+#[test]
 fn test_mod_after_use_not_at_bottom() {
     let path = test_dir().join("mod_after_use.rs");
     fs::write(

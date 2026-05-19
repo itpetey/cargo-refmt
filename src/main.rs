@@ -583,6 +583,9 @@ fn merge_use_trees(snippets: &[String]) -> Option<Vec<String>> {
         let Item::Use(use_item) = item else {
             return None;
         };
+        if !use_item.attrs.is_empty() {
+            return None;
+        }
         let root = use_tree_root(&use_item.tree)?;
         let is_bare = !matches!(use_item.tree, syn::UseTree::Path(_));
         let rest = match use_item.tree {
