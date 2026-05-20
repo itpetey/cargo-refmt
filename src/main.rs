@@ -516,6 +516,15 @@ fn item_name(item: &Item) -> Option<String> {
     }
 }
 
+fn item_is_public_type(item: &Item) -> bool {
+    match item {
+        Item::Struct(item) => matches!(item.vis, syn::Visibility::Public(_)),
+        Item::Enum(item) => matches!(item.vis, syn::Visibility::Public(_)),
+        Item::Union(item) => matches!(item.vis, syn::Visibility::Public(_)),
+        _ => false,
+    }
+}
+
 fn item_snippet(item: &Item, src: &str, line_starts: &[usize]) -> String {
     let mut range = span_range(item.span(), line_starts, src.len());
 
@@ -821,24 +830,26 @@ fn reorder_file(path: &Path) -> Result<()> {
 
 fn sort_type_items_by_dependencies(items: Vec<Item>) -> Vec<Item> {
     let local_types = items.iter().filter_map(item_name).collect::<HashSet<_>>();
+    let is_public = items.iter().map(item_is_public_type).collect::<Vec<_>>();
     let type_indexes = items
         .iter()
         .enumerate()
         .filter_map(|(index, item)| item_name(item).map(|name| (name, index)))
         .collect::<HashMap<_, _>>();
-    let dependency_indexes = items
-        .iter()
-        .map(|item| {
-            collect_type_item_dependencies(item, &local_types)
-                .into_iter()
-                .filter_map(|dependency| type_indexes.get(&dependency).copied())
-                .collect::<HashSet<_>>()
-        })
-        .collect::<Vec<_>>();
-    let mut dependent_indexes = vec![HashSet::new(); items.len()];
-    for (index, dependencies) in dependency_indexes.iter().enumerate() {
-        for dependency in dependencies {
-            dependent_indexes[*dependency].insert(index);
+
+    let mut dependency_indexes = vec![HashSet::new(); items.len()];
+    for (index, item) in items.iter().enumerate() {
+        for dependency in collect_type_item_dependencies(item, &local_types) {
+            let Some(dependency_index) = type_indexes.get(&dependency).copied() else {
+                continue;
+            };
+
+            // Public items should lead their private implementation details.
+            if is_public[index] && !is_public[dependency_index] {
+                dependency_indexes[dependency_index].insert(index);
+            } else {
+                dependency_indexes[index].insert(dependency_index);
+            }
         }
     }
 
@@ -850,9 +861,9 @@ fn sort_type_items_by_dependencies(items: Vec<Item>) -> Vec<Item> {
         let next = (0..items.len())
             .find(|&index| {
                 !placed[index]
-                    && dependent_indexes[index]
+                    && dependency_indexes[index]
                         .iter()
-                        .all(|dependent| placed[*dependent])
+                        .all(|dependency| placed[*dependency])
             })
             .or_else(|| (0..items.len()).find(|&index| !placed[index]));
 

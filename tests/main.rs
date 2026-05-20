@@ -258,7 +258,7 @@ pub fn public_fn() {}
 }
 
 #[test]
-fn test_shared_memory_handle_before_guest_context() {
+fn test_guest_context_before_shared_memory_handle() {
     let path = test_dir().join("guest_context_dependencies.rs");
     fs::write(
         &path,
@@ -288,10 +288,10 @@ pub struct GuestContext {
         .expect("SharedMemoryHandle not found");
 
     assert!(
-        shared_memory_pos < guest_context_pos,
-        "SharedMemoryHandle should come before GuestContext: SharedMemoryHandle at {}, GuestContext at {}",
-        shared_memory_pos,
+        guest_context_pos < shared_memory_pos,
+        "GuestContext should come before SharedMemoryHandle: GuestContext at {}, SharedMemoryHandle at {}",
         guest_context_pos,
+        shared_memory_pos
     );
 }
 
@@ -735,16 +735,16 @@ pub type ValidatorId = &'static str;
 }
 
 #[test]
-fn test_type_order_dependent_before_dependency() {
+fn test_type_order_dependency_before_dependent() {
     let path = test_dir().join("sort_by_usage.rs");
     fs::write(
         &path,
         "\
-struct Bar;
-
 enum Foo {
     Opt(Bar),
 }
+
+struct Bar;
 ",
     )
     .expect("failed to write test file");
@@ -754,11 +754,11 @@ enum Foo {
     assert_eq!(
         result,
         "\
+struct Bar;
+
 enum Foo {
     Opt(Bar),
 }
-
-struct Bar;
 "
     );
 }
