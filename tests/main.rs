@@ -258,7 +258,7 @@ pub fn public_fn() {}
 }
 
 #[test]
-fn test_guest_context_before_shared_memory_handle() {
+fn test_shared_memory_handle_before_guest_context() {
     let path = test_dir().join("guest_context_dependencies.rs");
     fs::write(
         &path,
@@ -288,10 +288,10 @@ pub struct GuestContext {
         .expect("SharedMemoryHandle not found");
 
     assert!(
-        guest_context_pos < shared_memory_pos,
-        "GuestContext should come before SharedMemoryHandle: GuestContext at {}, SharedMemoryHandle at {}",
+        shared_memory_pos < guest_context_pos,
+        "SharedMemoryHandle should come before GuestContext: SharedMemoryHandle at {}, GuestContext at {}",
+        shared_memory_pos,
         guest_context_pos,
-        shared_memory_pos
     );
 }
 
@@ -735,16 +735,16 @@ pub type ValidatorId = &'static str;
 }
 
 #[test]
-fn test_type_order_dependency_before_dependent() {
+fn test_type_order_dependent_before_dependency() {
     let path = test_dir().join("sort_by_usage.rs");
     fs::write(
         &path,
         "\
+struct Bar;
+
 enum Foo {
     Opt(Bar),
 }
-
-struct Bar;
 ",
     )
     .expect("failed to write test file");
@@ -754,12 +754,48 @@ struct Bar;
     assert_eq!(
         result,
         "\
-struct Bar;
-
 enum Foo {
     Opt(Bar),
 }
+
+struct Bar;
 "
+    );
+}
+
+#[test]
+fn test_type_order_public_wrapper_before_private_inner() {
+    let path = test_dir().join("pattern_fabric_dependencies.rs");
+    fs::write(
+        &path,
+        "\
+#[derive(Default)]
+struct PatternFabricInner {
+    topics: RwLock<HashMap<String, broadcast::Sender<Vec<u8>>>>,
+}
+
+#[derive(Clone, Default)]
+pub struct PatternFabric {
+    inner: Arc<PatternFabricInner>,
+}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    let fabric_pos = result
+        .find("pub struct PatternFabric")
+        .expect("PatternFabric not found");
+    let inner_pos = result
+        .find("struct PatternFabricInner")
+        .expect("PatternFabricInner not found");
+
+    assert!(
+        fabric_pos < inner_pos,
+        "PatternFabric should come before PatternFabricInner: PatternFabric at {}, PatternFabricInner at {}",
+        fabric_pos,
+        inner_pos
     );
 }
 

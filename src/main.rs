@@ -835,6 +835,12 @@ fn sort_type_items_by_dependencies(items: Vec<Item>) -> Vec<Item> {
                 .collect::<HashSet<_>>()
         })
         .collect::<Vec<_>>();
+    let mut dependent_indexes = vec![HashSet::new(); items.len()];
+    for (index, dependencies) in dependency_indexes.iter().enumerate() {
+        for dependency in dependencies {
+            dependent_indexes[*dependency].insert(index);
+        }
+    }
 
     let mut items = items.into_iter().map(Some).collect::<Vec<_>>();
     let mut placed = vec![false; items.len()];
@@ -844,9 +850,9 @@ fn sort_type_items_by_dependencies(items: Vec<Item>) -> Vec<Item> {
         let next = (0..items.len())
             .find(|&index| {
                 !placed[index]
-                    && dependency_indexes[index]
+                    && dependent_indexes[index]
                         .iter()
-                        .all(|dependency| placed[*dependency])
+                        .all(|dependent| placed[*dependent])
             })
             .or_else(|| (0..items.len()).find(|&index| !placed[index]));
 
