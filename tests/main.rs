@@ -861,3 +861,45 @@ pub enum PublicEnum {
         private_enum_pos
     );
 }
+
+#[test]
+fn test_preserves_safety_comments_before_unsafe_impl() {
+    let path = test_dir().join("safety_comments.rs");
+    fs::write(
+        &path,
+        "\
+struct RegionMappingInner {
+    base: *mut u8,
+}
+
+// SAFETY (Send): RegionMappingInner contains a `base: *mut u8` raw pointer.
+// In WASM mode, this pointer references shared linear memory that remains valid
+// for the guest's entire lifetime, so moving it across threads is safe.
+unsafe impl Send for RegionMappingInner {}
+
+// SAFETY (Sync): See the Send rationale above.
+// the raw pointer is stable and all mutations go through atomic operations.
+unsafe impl Sync for RegionMappingInner {}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert!(
+        result.contains("// SAFETY (Send):"),
+        "should preserve SAFETY comment for Send impl: {result}"
+    );
+    assert!(
+        result.contains("// SAFETY (Sync):"),
+        "should preserve SAFETY comment for Sync impl: {result}"
+    );
+    assert!(
+        result.contains("unsafe impl Send for RegionMappingInner"),
+        "should preserve Send impl: {result}"
+    );
+    assert!(
+        result.contains("unsafe impl Sync for RegionMappingInner"),
+        "should preserve Sync impl: {result}"
+    );
+}

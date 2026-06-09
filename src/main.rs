@@ -537,7 +537,69 @@ fn item_snippet(item: &Item, src: &str, line_starts: &[usize]) -> String {
 
     range.start = range.start.min(range.end);
 
+    // Extend range backward to include any immediately preceding comments
+    range.start = preceding_comment_start(src, range.start);
+
     src[range].trim_end().to_string()
+}
+
+/// Walk backward from `start` to find where preceding line comments begin.
+/// Returns the byte offset of the first comment line that is part of the
+/// contiguous block of comments immediately before `start`.
+fn preceding_comment_start(src: &str, start: usize) -> usize {
+    // Find the start of the line containing `start`
+    let line_start = src[..start].rfind('\n').map(|pos| pos + 1).unwrap_or(0);
+
+    // Walk backward line by line looking for comments
+    let mut current_line_start = line_start;
+    let mut comment_block_start = line_start;
+
+    loop {
+        // Find the previous line
+        if current_line_start == 0 {
+            break;
+        }
+
+        // Go back to find the end of the previous line (before the newline)
+        let prev_newline = src[..current_line_start - 1].rfind('\n');
+        let prev_line_start = prev_newline.map(|pos| pos + 1).unwrap_or(0);
+        let prev_line_end = current_line_start - 1; // exclude the newline
+
+        let prev_line = &src[prev_line_start..prev_line_end];
+        let trimmed = prev_line.trim();
+
+        if trimmed.starts_with("//") {
+            // Line comment - include it
+            comment_block_start = prev_line_start;
+            current_line_start = prev_line_start;
+        } else if trimmed.is_empty() {
+            // Blank line - stop looking
+            break;
+        } else if trimmed.ends_with("*/") {
+            // End of a block comment - find its start
+            if let Some(block_start) = find_block_comment_start(src, prev_line_start, prev_line_end)
+            {
+                comment_block_start = block_start;
+                current_line_start = block_start;
+            } else {
+                break;
+            }
+        } else {
+            // Non-comment line - stop
+            break;
+        }
+    }
+
+    comment_block_start
+}
+
+/// Find the start of a block comment that ends at or before `end`.
+/// Searches backward from `end` through the source to find the opening `/*`.
+fn find_block_comment_start(src: &str, _search_start: usize, end: usize) -> Option<usize> {
+    // Search backward through the entire source up to `end` for the opening /*
+    let search_region = &src[..end];
+    let pos = search_region.rfind("/*")?;
+    Some(pos)
 }
 
 fn item_sort_key(item: &Item) -> String {
