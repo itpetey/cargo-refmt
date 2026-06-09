@@ -355,6 +355,18 @@ fn has_cfg_test(attrs: &[Attribute]) -> bool {
     })
 }
 
+fn has_rustfmt_skip(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        let segments: Vec<_> = attr
+            .path()
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        segments.len() >= 2 && segments[0] == "rustfmt" && segments.last().unwrap() == "skip"
+    })
+}
+
 fn header_to_string(attrs: &[Attribute], src: &str, line_starts: &[usize]) -> String {
     if attrs.is_empty() {
         return String::new();
@@ -799,8 +811,103 @@ fn reorder_file(path: &Path) -> Result<()> {
     let shebang = file.shebang.take();
     let crate_attrs = std::mem::take(&mut file.attrs);
 
-    let (struct_enum_items, rest_items): (Vec<_>, Vec<_>) = file
-        .items
+    let is_main_rs = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "main.rs");
+
+    // Break items into segments separated by #[rustfmt::skip] items.
+    // Each segment of consecutive non-skip items is reordered independently;
+    // skip items are kept verbatim at their original positions.
+    enum Segment {
+        Skip(String),
+        Process(Vec<Item>),
+    }
+
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut pending: Vec<Item> = Vec::new();
+
+    for item in file.items {
+        if has_rustfmt_skip(item_attributes(&item)) {
+            if !pending.is_empty() {
+                segments.push(Segment::Process(std::mem::take(&mut pending)));
+            }
+            let snippet = item_snippet(&item, &src, &line_starts);
+            segments.push(Segment::Skip(snippet));
+        } else {
+            pending.push(item);
+        }
+    }
+    if !pending.is_empty() {
+        segments.push(Segment::Process(pending));
+    }
+
+    // Build output from segments
+    let mut out = String::new();
+    if let Some(sb) = shebang {
+        out.push_str(&sb);
+        out.push('\n');
+    }
+    if !crate_attrs.is_empty() {
+        let header = header_to_string(&crate_attrs, &src, &line_starts);
+        out.push_str(header.trim_end());
+        out.push_str("\n\n");
+    }
+
+    let mut wrote_any = !out.is_empty();
+
+    for segment in segments {
+        match segment {
+            Segment::Skip(snippet) => {
+                if wrote_any {
+                    while !out.ends_with("\n\n") {
+                        out.push('\n');
+                    }
+                }
+                out.push_str(&snippet);
+                out.push('\n');
+                wrote_any = true;
+            }
+            Segment::Process(items) => {
+                let reordered = reorder_items_to_string(items, &src, &line_starts, is_main_rs);
+                if !reordered.is_empty() {
+                    if wrote_any {
+                        while !out.ends_with("\n\n") {
+                            out.push('\n');
+                        }
+                    }
+                    out.push_str(&reordered);
+                    wrote_any = true;
+                }
+            }
+        }
+    }
+
+    while out.ends_with("\n\n\n") {
+        out.pop();
+    }
+    let src_has_trailing_newline = src.ends_with('\n');
+    let out_has_trailing_newline = out.ends_with('\n');
+    if src_has_trailing_newline && !out_has_trailing_newline {
+        out.push('\n');
+    } else if !src_has_trailing_newline && out_has_trailing_newline {
+        out.pop();
+    }
+
+    if out != src {
+        fs::write(path, out)?;
+    }
+
+    Ok(())
+}
+
+fn reorder_items_to_string(
+    items: Vec<Item>,
+    src: &str,
+    line_starts: &[usize],
+    is_main_rs: bool,
+) -> String {
+    let (struct_enum_items, rest_items): (Vec<_>, Vec<_>) = items
         .into_iter()
         .partition(|item| matches!(item, Item::Struct(_) | Item::Enum(_) | Item::Union(_)));
 
@@ -809,11 +916,6 @@ fn reorder_file(path: &Path) -> Result<()> {
         .partition(|item| matches!(item, Item::Fn(_)));
 
     let sorted_struct_enums = sort_type_items_by_dependencies(struct_enum_items);
-
-    let is_main_rs = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n == "main.rs");
 
     let mut sorted_fn_items = fn_items;
     sorted_fn_items.sort_by(|a, b| {
@@ -834,18 +936,18 @@ fn reorder_file(path: &Path) -> Result<()> {
 
     let mut buckets: Vec<Vec<BucketItem>> = (0..14).map(|_| Vec::new()).collect();
 
-    let impl_items = collect_impls_and_bucket_rest(other_items, &mut buckets, &src, &line_starts);
+    let impl_items = collect_impls_and_bucket_rest(other_items, &mut buckets, src, line_starts);
 
     let type_order: Vec<String> = sorted_struct_enums
         .iter()
         .filter_map(|item| item_name(item))
         .collect();
 
-    push_type_items(sorted_struct_enums, &mut buckets, &src, &line_starts);
+    push_type_items(sorted_struct_enums, &mut buckets, src, line_starts);
     push_ordered_impls(impl_items, &type_order, &mut buckets[10]);
 
     for item in sorted_fn_items.into_iter() {
-        let snippet = item_snippet(&item, &src, &line_starts);
+        let snippet = item_snippet(&item, src, line_starts);
         buckets[11].push(BucketItem {
             sort_key: item_sort_key(&item),
             snippet,
@@ -853,17 +955,7 @@ fn reorder_file(path: &Path) -> Result<()> {
     }
 
     let mut out = String::new();
-    if let Some(sb) = shebang {
-        out.push_str(&sb);
-        out.push('\n');
-    }
-    if !crate_attrs.is_empty() {
-        let header = header_to_string(&crate_attrs, &src, &line_starts);
-        out.push_str(header.trim_end());
-        out.push_str("\n\n");
-    }
-
-    let mut wrote_any = !out.is_empty();
+    let mut wrote_any = false;
 
     let order = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 10, 11, 12];
     for idx in order {
@@ -872,22 +964,7 @@ fn reorder_file(path: &Path) -> Result<()> {
         }
     }
 
-    while out.ends_with("\n\n\n") {
-        out.pop();
-    }
-    let src_has_trailing_newline = src.ends_with('\n');
-    let out_has_trailing_newline = out.ends_with('\n');
-    if src_has_trailing_newline && !out_has_trailing_newline {
-        out.push('\n');
-    } else if !src_has_trailing_newline && out_has_trailing_newline {
-        out.pop();
-    }
-
-    if out != src {
-        fs::write(path, out)?;
-    }
-
-    Ok(())
+    out
 }
 
 fn sort_type_items_by_dependencies(items: Vec<Item>) -> Vec<Item> {

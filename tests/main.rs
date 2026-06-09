@@ -903,3 +903,210 @@ unsafe impl Sync for RegionMappingInner {}
         "should preserve Sync impl: {result}"
     );
 }
+
+#[test]
+fn test_rustfmt_skip_struct_preserves_position() {
+    let path = test_dir().join("rustfmt_skip_struct.rs");
+    fs::write(
+        &path,
+        "\
+use std::collections::HashMap;
+
+#[rustfmt::skip]
+pub struct SkippedStruct {
+  a: i32,
+    b: i32,
+}
+
+use std::fs;
+
+pub fn run() {}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    // Skipped struct should remain between the two use groups and the fn
+    let skip_pos = result
+        .find("#[rustfmt::skip]")
+        .expect("skip attr not found");
+    let use_fs_pos = result.find("use std::fs;").expect("use std::fs not found");
+    let fn_pos = result.find("pub fn run").expect("fn not found");
+    assert!(
+        skip_pos < use_fs_pos,
+        "skip before use std::fs: skip at {skip_pos}, use at {use_fs_pos}"
+    );
+    assert!(
+        skip_pos < fn_pos,
+        "skip before fn: skip at {skip_pos}, fn at {fn_pos}"
+    );
+    // Verify indentation is preserved (not rustfmt'd)
+    assert!(
+        result.contains("  a: i32,"),
+        "skip struct should preserve original indentation"
+    );
+    assert!(
+        result.contains("    b: i32,"),
+        "skip struct should preserve original indentation"
+    );
+}
+
+#[test]
+fn test_rustfmt_skip_fn_preserves_position() {
+    let path = test_dir().join("rustfmt_skip_fn.rs");
+    fs::write(
+        &path,
+        "\
+use std::fs;
+
+#[rustfmt::skip]
+fn skipped_fn() {
+  let x = 1;
+    let y = 2;
+}
+
+pub fn other_fn() {}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    let skip_pos = result.find("skipped_fn").expect("skipped_fn not found");
+    let other_fn_pos = result.find("pub fn other_fn").expect("other_fn not found");
+    assert!(
+        skip_pos < other_fn_pos,
+        "skipped_fn before other_fn: skip at {skip_pos}, other at {other_fn_pos}"
+    );
+    assert!(
+        result.contains("  let x = 1;"),
+        "skip fn should preserve original indentation"
+    );
+}
+
+#[test]
+fn test_rustfmt_skip_mod_preserves_position() {
+    let path = test_dir().join("rustfmt_skip_mod.rs");
+    fs::write(
+        &path,
+        "\
+use std::fs;
+
+#[rustfmt::skip]
+pub mod skipped {
+  pub fn inner() {}
+}
+
+pub fn run() {}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    let skip_pos = result.find("mod skipped").expect("skipped mod not found");
+    let fn_pos = result.find("pub fn run").expect("fn not found");
+    assert!(
+        skip_pos < fn_pos,
+        "skipped mod before fn: mod at {skip_pos}, fn at {fn_pos}"
+    );
+    assert!(
+        result.contains("  pub fn inner"),
+        "skip mod should preserve original indentation"
+    );
+}
+
+#[test]
+fn test_rustfmt_skip_multiple_items() {
+    let path = test_dir().join("rustfmt_skip_multiple.rs");
+    fs::write(
+        &path,
+        "\
+use std::collections::HashMap;
+
+#[rustfmt::skip]
+struct Alpha {
+  x: i32,
+}
+
+use std::fs;
+
+#[rustfmt::skip]
+struct Beta {
+    y: i32,
+}
+
+pub fn run() {}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    let alpha_pos = result.find("struct Alpha").expect("Alpha not found");
+    let beta_pos = result.find("struct Beta").expect("Beta not found");
+    let fn_pos = result.find("pub fn run").expect("fn not found");
+    assert!(
+        alpha_pos < beta_pos,
+        "Alpha before Beta: Alpha at {alpha_pos}, Beta at {beta_pos}"
+    );
+    assert!(
+        beta_pos < fn_pos,
+        "Beta before fn: Beta at {beta_pos}, fn at {fn_pos}"
+    );
+    assert!(
+        result.contains("  x: i32,"),
+        "Alpha should preserve indentation"
+    );
+    assert!(
+        result.contains("    y: i32,"),
+        "Beta should preserve indentation"
+    );
+}
+
+#[test]
+fn test_rustfmt_skip_impl_block() {
+    let path = test_dir().join("rustfmt_skip_impl.rs");
+    fs::write(
+        &path,
+        "\
+pub struct Foo {
+    value: i32,
+}
+
+pub struct Bar {
+    value: i32,
+}
+
+#[rustfmt::skip]
+impl Foo {
+  pub fn new() -> Self {
+    Self { value: 0 }
+  }
+}
+
+impl Bar {
+    pub fn new() -> Self {
+        Self { value: 0 }
+    }
+}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    let foo_impl_pos = result
+        .find("#[rustfmt::skip]\nimpl Foo")
+        .expect("Foo impl not found");
+    let bar_impl_pos = result.find("impl Bar").expect("Bar impl not found");
+    assert!(
+        foo_impl_pos < bar_impl_pos,
+        "Foo impl before Bar impl: Foo at {foo_impl_pos}, Bar at {bar_impl_pos}"
+    );
+    assert!(
+        result.contains("  pub fn new"),
+        "skip impl should preserve original indentation"
+    );
+}
