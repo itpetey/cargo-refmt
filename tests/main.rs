@@ -181,7 +181,9 @@ fn test_dir() -> PathBuf {
 
 #[test]
 fn test_fn_main_first_in_main_rs() {
-    let path = test_dir().join("main.rs");
+    let dir = test_dir().join("src");
+    fs::create_dir_all(&dir).expect("failed to create src dir");
+    let path = dir.join("main.rs");
     fs::write(
         &path,
         "\

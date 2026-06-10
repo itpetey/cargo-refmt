@@ -66,8 +66,15 @@ fn main() -> Result<()> {
 
     let files = collect_input_files(paths)?;
 
-    for path in files {
-        reorder_file(&path).with_context(|| format!("refmt {}", path.display()))?;
+    // Pre-scan all files for #[rustfmt::skip] on module declarations and
+    // #![rustfmt::skip] at the file level, building a set of paths to skip.
+    let skipped_paths = collect_skipped_module_paths(&files)?;
+
+    for path in &files {
+        if is_path_skipped(path, &skipped_paths) {
+            continue;
+        }
+        reorder_file(path).with_context(|| format!("refmt {}", path.display()))?;
     }
 
     // Run `cargo fmt` last to catch any outstanding formatting issues
@@ -538,6 +545,17 @@ fn item_is_public_type(item: &Item) -> bool {
 }
 
 fn item_snippet(item: &Item, src: &str, line_starts: &[usize]) -> String {
+    let range = item_snippet_byte_range(item, src, line_starts);
+    src[range].trim_end().to_string()
+}
+
+/// Returns the byte range of the item's snippet in the original source,
+/// extended backward to include any preceding attributes and comments.
+fn item_snippet_byte_range(
+    item: &Item,
+    src: &str,
+    line_starts: &[usize],
+) -> std::ops::Range<usize> {
     let mut range = span_range(item.span(), line_starts, src.len());
 
     for attr in item_attributes(item) {
@@ -552,7 +570,7 @@ fn item_snippet(item: &Item, src: &str, line_starts: &[usize]) -> String {
     // Extend range backward to include any immediately preceding comments
     range.start = preceding_comment_start(src, range.start);
 
-    src[range].trim_end().to_string()
+    range
 }
 
 /// Walk backward from `start` to find where preceding line comments begin.
@@ -802,6 +820,82 @@ fn push_type_items(
     }
 }
 
+/// Resolve a `mod name;` declaration to the filesystem path that should be
+/// skipped when the declaration carries `#[rustfmt::skip]`.
+///
+/// Returns the directory path for a directory module (`path/name/mod.rs`),
+/// the file path for a file module (`path/name.rs`), or `None` if the
+/// module is inline (no external file).
+fn resolve_module_path(containing_file: &Path, mod_name: &str) -> Option<PathBuf> {
+    let parent = containing_file.parent()?;
+
+    // Directory module: parent/name/mod.rs  → skip parent/name/
+    let mod_rs = parent.join(mod_name).join("mod.rs");
+    if mod_rs.exists() {
+        return Some(parent.join(mod_name));
+    }
+
+    // File module: parent/name.rs  → skip that file
+    let rs_file = parent.join(format!("{}.rs", mod_name));
+    if rs_file.exists() {
+        return Some(rs_file);
+    }
+
+    // Directory exists (edition 2024 inline module directory)
+    let dir = parent.join(mod_name);
+    if dir.is_dir() {
+        return Some(dir);
+    }
+
+    None
+}
+
+/// Scan every collected file for two kinds of skip marker:
+///
+///   1. `#![rustfmt::skip]` at file level – the file itself is skipped.
+///   2. `#[rustfmt::skip]` on a `mod name;` item – the module's external
+///      file or directory tree is skipped.
+///
+/// Returns a set of filesystem paths that should not be processed.
+fn collect_skipped_module_paths(files: &[PathBuf]) -> Result<HashSet<PathBuf>> {
+    let mut skipped = HashSet::new();
+
+    for path in files {
+        let src = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let file: File =
+            syn::parse_file(&src).with_context(|| format!("parse {}", path.display()))?;
+
+        // Check for file-level #![rustfmt::skip]
+        if has_rustfmt_skip(&file.attrs) {
+            skipped.insert(path.clone());
+            continue;
+        }
+
+        // Check for #[rustfmt::skip] on module items
+        for item in &file.items {
+            if let Item::Mod(mod_item) = item {
+                if has_rustfmt_skip(&mod_item.attrs) {
+                    if let Some(resolved) = resolve_module_path(path, &mod_item.ident.to_string()) {
+                        skipped.insert(resolved);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(skipped)
+}
+
+/// Returns `true` when `path` sits inside (or is equal to) one of the
+/// skipped paths collected by [`collect_skipped_module_paths`].
+fn is_path_skipped(path: &Path, skipped_paths: &HashSet<PathBuf>) -> bool {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    skipped_paths.iter().any(|skipped| {
+        let s = skipped.canonicalize().unwrap_or_else(|_| skipped.clone());
+        canonical.starts_with(&s)
+    })
+}
+
 fn reorder_file(path: &Path) -> Result<()> {
     let src = fs::read_to_string(path).with_context(|| format!("read file {}", path.display()))?;
     let mut file: File =
@@ -810,6 +904,11 @@ fn reorder_file(path: &Path) -> Result<()> {
 
     let shebang = file.shebang.take();
     let crate_attrs = std::mem::take(&mut file.attrs);
+
+    // Honour file-level #![rustfmt::skip] — skip the entire file.
+    if has_rustfmt_skip(&crate_attrs) {
+        return Ok(());
+    }
 
     let file_name = path.file_name().and_then(|n| n.to_str());
 
@@ -831,22 +930,72 @@ fn reorder_file(path: &Path) -> Result<()> {
     // Each segment of consecutive non-skip items is reordered independently;
     // skip items are kept verbatim at their original positions.
     enum Segment {
-        Skip(String),
+        Skip {
+            snippet: String,
+            leading: String,
+            trailing: String,
+        },
         Process(Vec<Item>),
     }
 
     let mut segments: Vec<Segment> = Vec::new();
     let mut pending: Vec<Item> = Vec::new();
+    // Byte offset in `src` right after the last iterated item's snippet end.
+    // Used to compute the leading gap for skip items.
+    let mut prev_item_end: Option<usize> = None;
+    // Pre-compute snippet byte ranges for all items so we can look at neighbours.
+    let item_info: Vec<(std::ops::Range<usize>, Item)> = file
+        .items
+        .iter()
+        .map(|item| {
+            let range = item_snippet_byte_range(item, &src, &line_starts);
+            (range, item.clone()) // Item is cheap to clone (it's an AST)
+        })
+        .collect();
 
-    for item in file.items {
+    for (i, (item_range, item)) in item_info.into_iter().enumerate() {
+        let snippet_text = src[item_range.clone()].trim_end().to_string();
+
         if has_rustfmt_skip(item_attributes(&item)) {
             if !pending.is_empty() {
                 segments.push(Segment::Process(std::mem::take(&mut pending)));
             }
-            let snippet = item_snippet(&item, &src, &line_starts);
-            segments.push(Segment::Skip(snippet));
+            // Capture original leading whitespace between previous item and this skip
+            let leading = match prev_item_end {
+                Some(end) => {
+                    let raw_gap = &src[end..item_range.start];
+                    // Strip one leading \n — the line terminator of the previous
+                    // item, which is already provided by write_bucket.
+                    raw_gap.strip_prefix('\n').unwrap_or(raw_gap).to_string()
+                }
+                None => String::new(),
+            };
+            // Capture original trailing whitespace between this skip and the next item.
+            // If the next item is also a skip, its leading will handle the spacing
+            // so we leave trailing empty to avoid double-counting.
+            let trailing = file
+                .items
+                .get(i + 1)
+                .map(|next| {
+                    if has_rustfmt_skip(item_attributes(next)) {
+                        return String::new();
+                    }
+                    let next_range = item_snippet_byte_range(next, &src, &line_starts);
+                    let raw_gap = &src[item_range.end..next_range.start];
+                    // Strip one leading \n — the line terminator of this skip's
+                    // last line, which is already added by the output builder.
+                    raw_gap.strip_prefix('\n').unwrap_or(raw_gap).to_string()
+                })
+                .unwrap_or_default();
+            segments.push(Segment::Skip {
+                snippet: snippet_text,
+                leading,
+                trailing,
+            });
+            prev_item_end = Some(item_range.end);
         } else {
             pending.push(item);
+            prev_item_end = Some(item_range.end);
         }
     }
     if !pending.is_empty() {
@@ -866,29 +1015,37 @@ fn reorder_file(path: &Path) -> Result<()> {
     }
 
     let mut wrote_any = !out.is_empty();
+    let mut prev_was_skip = false;
 
     for segment in segments {
         match segment {
-            Segment::Skip(snippet) => {
-                if wrote_any {
-                    while !out.ends_with("\n\n") {
-                        out.push('\n');
-                    }
+            Segment::Skip {
+                snippet,
+                leading,
+                trailing,
+            } => {
+                if wrote_any && !leading.is_empty() {
+                    out.push_str(&leading);
                 }
                 out.push_str(&snippet);
                 out.push('\n');
+                if !trailing.is_empty() {
+                    out.push_str(&trailing);
+                }
                 wrote_any = true;
+                prev_was_skip = true;
             }
             Segment::Process(items) => {
                 let reordered = reorder_items_to_string(items, &src, &line_starts, is_entry_point);
                 if !reordered.is_empty() {
-                    if wrote_any {
+                    if wrote_any && !prev_was_skip {
                         while !out.ends_with("\n\n") {
                             out.push('\n');
                         }
                     }
                     out.push_str(&reordered);
                     wrote_any = true;
+                    prev_was_skip = false;
                 }
             }
         }
