@@ -811,10 +811,21 @@ fn reorder_file(path: &Path) -> Result<()> {
     let shebang = file.shebang.take();
     let crate_attrs = std::mem::take(&mut file.attrs);
 
-    let is_main_rs = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n == "main.rs");
+    let file_name = path.file_name().and_then(|n| n.to_str());
+
+    let is_main_rs = file_name == Some("main.rs")
+        && path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("src");
+
+    let is_build_rs = file_name == Some("build.rs")
+        && !path
+            .ancestors()
+            .any(|a| a.file_name().and_then(|n| n.to_str()) == Some("src"));
+
+    let is_entry_point = is_main_rs || is_build_rs;
 
     // Break items into segments separated by #[rustfmt::skip] items.
     // Each segment of consecutive non-skip items is reordered independently;
@@ -869,7 +880,7 @@ fn reorder_file(path: &Path) -> Result<()> {
                 wrote_any = true;
             }
             Segment::Process(items) => {
-                let reordered = reorder_items_to_string(items, &src, &line_starts, is_main_rs);
+                let reordered = reorder_items_to_string(items, &src, &line_starts, is_entry_point);
                 if !reordered.is_empty() {
                     if wrote_any {
                         while !out.ends_with("\n\n") {
@@ -905,7 +916,7 @@ fn reorder_items_to_string(
     items: Vec<Item>,
     src: &str,
     line_starts: &[usize],
-    is_main_rs: bool,
+    is_entry_point: bool,
 ) -> String {
     let (struct_enum_items, rest_items): (Vec<_>, Vec<_>) = items
         .into_iter()
@@ -919,7 +930,7 @@ fn reorder_items_to_string(
 
     let mut sorted_fn_items = fn_items;
     sorted_fn_items.sort_by(|a, b| {
-        if is_main_rs {
+        if is_entry_point {
             let a_is_main = fn_item_name(a) == "main";
             let b_is_main = fn_item_name(b) == "main";
             if a_is_main && !b_is_main {
