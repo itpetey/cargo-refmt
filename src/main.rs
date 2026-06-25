@@ -5,9 +5,11 @@ use std::{
     process::Command,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
 use syn::{Attribute, File, Item, spanned::Spanned, visit::Visit};
+
+mod paths;
 
 type Cat = usize;
 
@@ -64,16 +66,9 @@ fn main() -> Result<()> {
         args.paths
     };
 
-    let files = collect_input_files(paths)?;
+    let input = paths::InputCollector::new()?.collect(paths)?;
 
-    // Pre-scan all files for #[rustfmt::skip] on module declarations and
-    // #![rustfmt::skip] at the file level, building a set of paths to skip.
-    let skipped_paths = collect_skipped_module_paths(&files)?;
-
-    for path in &files {
-        if is_path_skipped(path, &skipped_paths) {
-            continue;
-        }
+    for path in input.iter_active() {
         reorder_file(path).with_context(|| format!("refmt {}", path.display()))?;
     }
 
@@ -137,52 +132,6 @@ fn category(item: &Item) -> Cat {
     }
 }
 
-fn collect_directory(
-    dir: &Path,
-    files: &mut Vec<PathBuf>,
-    seen: &mut HashSet<PathBuf>,
-) -> Result<()> {
-    let mut queue = std::collections::VecDeque::from([dir.to_path_buf()]);
-
-    while let Some(current) = queue.pop_front() {
-        let mut entries = Vec::new();
-        let read_dir = fs::read_dir(&current)
-            .with_context(|| format!("read directory {}", current.display()))?;
-
-        for entry in read_dir {
-            let entry = entry.with_context(|| format!("read entry in {}", current.display()))?;
-            entries.push(entry);
-        }
-
-        entries.sort_by_key(|a| a.path());
-
-        for entry in entries {
-            let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .with_context(|| format!("determine type for {}", path.display()))?;
-
-            if file_type.is_dir() {
-                queue.push_back(path);
-            } else if file_type.is_file() {
-                if is_rust_file(&path) {
-                    push_file(path, files, seen);
-                }
-            } else if file_type.is_symlink() {
-                let metadata = fs::metadata(&path)
-                    .with_context(|| format!("inspect symlink target {}", path.display()))?;
-                if metadata.is_dir() {
-                    continue;
-                } else if metadata.is_file() && is_rust_file(&path) {
-                    push_file(path, files, seen);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn collect_impls_and_bucket_rest(
     items: Vec<Item>,
     buckets: &mut [Vec<BucketItem>],
@@ -217,34 +166,6 @@ fn collect_impls_and_bucket_rest(
     }
 
     impls
-}
-
-fn collect_input_files(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    let mut seen = HashSet::new();
-
-    for path in paths {
-        collect_path(&path, &mut files, &mut seen)?;
-    }
-
-    if files.is_empty() {
-        bail!("no Rust files found");
-    }
-
-    Ok(files)
-}
-
-fn collect_path(path: &Path, files: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>) -> Result<()> {
-    let metadata =
-        fs::metadata(path).with_context(|| format!("inspect metadata for {}", path.display()))?;
-
-    if metadata.is_dir() {
-        collect_directory(path, files, seen)?;
-    } else if metadata.is_file() {
-        push_file(path.to_path_buf(), files, seen);
-    }
-
-    Ok(())
 }
 
 fn collect_type_item_dependencies(item: &Item, local_types: &HashSet<String>) -> HashSet<String> {
@@ -362,18 +283,6 @@ fn has_cfg_test(attrs: &[Attribute]) -> bool {
     })
 }
 
-fn has_rustfmt_skip(attrs: &[Attribute]) -> bool {
-    attrs.iter().any(|attr| {
-        let segments: Vec<_> = attr
-            .path()
-            .segments
-            .iter()
-            .map(|s| s.ident.to_string())
-            .collect();
-        segments.len() >= 2 && segments[0] == "rustfmt" && segments.last().unwrap() == "skip"
-    })
-}
-
 fn header_to_string(attrs: &[Attribute], src: &str, line_starts: &[usize]) -> String {
     if attrs.is_empty() {
         return String::new();
@@ -420,13 +329,6 @@ fn impl_target_matches_type(target: Option<&str>, type_name: &str) -> bool {
 
 fn impl_type_name(impl_item: &syn::ItemImpl) -> Option<String> {
     type_key(&impl_item.self_ty)
-}
-
-fn is_rust_file(path: &Path) -> bool {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) => ext.eq_ignore_ascii_case("rs"),
-        None => false,
-    }
 }
 
 fn is_rust_trait(trait_path: &syn::Path, local_traits: &HashSet<String>) -> bool {
@@ -763,12 +665,6 @@ fn path_key(path: &syn::Path) -> Option<String> {
     }
 }
 
-fn push_file(path: PathBuf, files: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>) {
-    if seen.insert(path.clone()) {
-        files.push(path);
-    }
-}
-
 fn push_ordered_impls(
     impls: Vec<ImplSnippet>,
     type_order: &[String],
@@ -820,82 +716,6 @@ fn push_type_items(
     }
 }
 
-/// Resolve a `mod name;` declaration to the filesystem path that should be
-/// skipped when the declaration carries `#[rustfmt::skip]`.
-///
-/// Returns the directory path for a directory module (`path/name/mod.rs`),
-/// the file path for a file module (`path/name.rs`), or `None` if the
-/// module is inline (no external file).
-fn resolve_module_path(containing_file: &Path, mod_name: &str) -> Option<PathBuf> {
-    let parent = containing_file.parent()?;
-
-    // Directory module: parent/name/mod.rs  → skip parent/name/
-    let mod_rs = parent.join(mod_name).join("mod.rs");
-    if mod_rs.exists() {
-        return Some(parent.join(mod_name));
-    }
-
-    // File module: parent/name.rs  → skip that file
-    let rs_file = parent.join(format!("{}.rs", mod_name));
-    if rs_file.exists() {
-        return Some(rs_file);
-    }
-
-    // Directory exists (edition 2024 inline module directory)
-    let dir = parent.join(mod_name);
-    if dir.is_dir() {
-        return Some(dir);
-    }
-
-    None
-}
-
-/// Scan every collected file for two kinds of skip marker:
-///
-///   1. `#![rustfmt::skip]` at file level – the file itself is skipped.
-///   2. `#[rustfmt::skip]` on a `mod name;` item – the module's external
-///      file or directory tree is skipped.
-///
-/// Returns a set of filesystem paths that should not be processed.
-fn collect_skipped_module_paths(files: &[PathBuf]) -> Result<HashSet<PathBuf>> {
-    let mut skipped = HashSet::new();
-
-    for path in files {
-        let src = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let file: File =
-            syn::parse_file(&src).with_context(|| format!("parse {}", path.display()))?;
-
-        // Check for file-level #![rustfmt::skip]
-        if has_rustfmt_skip(&file.attrs) {
-            skipped.insert(path.clone());
-            continue;
-        }
-
-        // Check for #[rustfmt::skip] on module items
-        for item in &file.items {
-            if let Item::Mod(mod_item) = item {
-                if has_rustfmt_skip(&mod_item.attrs) {
-                    if let Some(resolved) = resolve_module_path(path, &mod_item.ident.to_string()) {
-                        skipped.insert(resolved);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(skipped)
-}
-
-/// Returns `true` when `path` sits inside (or is equal to) one of the
-/// skipped paths collected by [`collect_skipped_module_paths`].
-fn is_path_skipped(path: &Path, skipped_paths: &HashSet<PathBuf>) -> bool {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    skipped_paths.iter().any(|skipped| {
-        let s = skipped.canonicalize().unwrap_or_else(|_| skipped.clone());
-        canonical.starts_with(&s)
-    })
-}
-
 fn reorder_file(path: &Path) -> Result<()> {
     let src = fs::read_to_string(path).with_context(|| format!("read file {}", path.display()))?;
     let mut file: File =
@@ -906,7 +726,7 @@ fn reorder_file(path: &Path) -> Result<()> {
     let crate_attrs = std::mem::take(&mut file.attrs);
 
     // Honour file-level #![rustfmt::skip] — skip the entire file.
-    if has_rustfmt_skip(&crate_attrs) {
+    if paths::has_rustfmt_skip(&crate_attrs) {
         return Ok(());
     }
 
@@ -956,7 +776,7 @@ fn reorder_file(path: &Path) -> Result<()> {
     for (i, (item_range, item)) in item_info.into_iter().enumerate() {
         let snippet_text = src[item_range.clone()].trim_end().to_string();
 
-        if has_rustfmt_skip(item_attributes(&item)) {
+        if paths::has_rustfmt_skip(item_attributes(&item)) {
             if !pending.is_empty() {
                 segments.push(Segment::Process(std::mem::take(&mut pending)));
             }
@@ -977,7 +797,7 @@ fn reorder_file(path: &Path) -> Result<()> {
                 .items
                 .get(i + 1)
                 .map(|next| {
-                    if has_rustfmt_skip(item_attributes(next)) {
+                    if paths::has_rustfmt_skip(item_attributes(next)) {
                         return String::new();
                     }
                     let next_range = item_snippet_byte_range(next, &src, &line_starts);
@@ -1349,16 +1169,6 @@ fn write_bucket(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_is_rust_file() {
-        assert!(is_rust_file(Path::new("foo.rs")));
-        assert!(is_rust_file(Path::new("foo.RS")));
-        assert!(!is_rust_file(Path::new("foo.Rust")));
-        assert!(!is_rust_file(Path::new("foo.txt")));
-        assert!(!is_rust_file(Path::new("foo")));
-        assert!(!is_rust_file(Path::new("foo.rs.txt")));
-    }
 
     #[test]
     fn test_line_start_offsets() {
