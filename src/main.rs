@@ -26,6 +26,7 @@ struct Args {
 struct BucketItem {
     sort_key: String,
     snippet: String,
+    is_skip: bool,
 }
 
 struct ImplSnippet {
@@ -137,7 +138,7 @@ fn collect_impls_and_bucket_rest(
     buckets: &mut [Vec<BucketItem>],
     src: &str,
     line_starts: &[usize],
-) -> Vec<ImplSnippet> {
+) -> Vec<(bool, ImplSnippet)> {
     let mut impls = Vec::new();
     let local_traits = items
         .iter()
@@ -149,18 +150,23 @@ fn collect_impls_and_bucket_rest(
         .collect::<HashSet<_>>();
 
     for (source_order, item) in items.into_iter().enumerate() {
+        let is_skip = paths::has_rustfmt_skip(item_attributes(&item));
         if let Item::Impl(impl_item) = &item {
-            impls.push(ImplSnippet {
-                target: impl_type_name(impl_item),
-                sort_category: impl_sort_category(impl_item, &local_traits),
-                source_order,
-                snippet: item_snippet(&item, src, line_starts),
-            });
+            impls.push((
+                is_skip,
+                ImplSnippet {
+                    target: impl_type_name(impl_item),
+                    sort_category: impl_sort_category(impl_item, &local_traits),
+                    source_order,
+                    snippet: item_snippet(&item, src, line_starts),
+                },
+            ));
         } else {
             let cat = category(&item);
             buckets[cat].push(BucketItem {
                 sort_key: item_sort_key(&item),
                 snippet: item_snippet(&item, src, line_starts),
+                is_skip,
             });
         }
     }
@@ -666,7 +672,7 @@ fn path_key(path: &syn::Path) -> Option<String> {
 }
 
 fn push_ordered_impls(
-    impls: Vec<ImplSnippet>,
+    impls: Vec<(bool, ImplSnippet)>,
     type_order: &[String],
     bucket: &mut Vec<BucketItem>,
 ) {
@@ -676,27 +682,29 @@ fn push_ordered_impls(
         let mut matching_impls = impls
             .iter()
             .enumerate()
-            .filter(|(_, impl_item)| {
+            .filter(|(_, (_, impl_item))| {
                 impl_target_matches_type(impl_item.target.as_deref(), type_name)
             })
             .collect::<Vec<_>>();
         matching_impls
-            .sort_by_key(|(_, impl_item)| (impl_item.sort_category, impl_item.source_order));
+            .sort_by_key(|(_, (_, impl_item))| (impl_item.sort_category, impl_item.source_order));
 
-        for (index, impl_item) in matching_impls {
+        for (index, (is_skip, impl_item)) in matching_impls {
             used_impls[index] = true;
             bucket.push(BucketItem {
                 sort_key: impl_item.target.clone().unwrap_or_default(),
                 snippet: impl_item.snippet.clone(),
+                is_skip: *is_skip,
             });
         }
     }
 
-    for (index, impl_item) in impls.into_iter().enumerate() {
+    for (index, (is_skip, impl_item)) in impls.into_iter().enumerate() {
         if !used_impls[index] {
             bucket.push(BucketItem {
                 sort_key: impl_item.target.unwrap_or_default(),
                 snippet: impl_item.snippet,
+                is_skip,
             });
         }
     }
@@ -709,9 +717,11 @@ fn push_type_items(
     line_starts: &[usize],
 ) {
     for item in items {
+        let is_skip = paths::has_rustfmt_skip(item_attributes(&item));
         buckets[9].push(BucketItem {
             sort_key: item_sort_key(&item),
             snippet: item_snippet(&item, src, line_starts),
+            is_skip,
         });
     }
 }
@@ -746,83 +756,14 @@ fn reorder_file(path: &Path) -> Result<()> {
 
     let is_entry_point = is_main_rs || is_build_rs;
 
-    // Break items into segments separated by #[rustfmt::skip] items.
-    // Each segment of consecutive non-skip items is reordered independently;
-    // skip items are kept verbatim at their original positions.
-    enum Segment {
-        Skip {
-            snippet: String,
-            leading: String,
-            trailing: String,
-        },
-        Process(Vec<Item>),
-    }
+    // Process all items together, sorted by category. #[rustfmt::skip] items
+    // preserve their formatting (snippet) and their relative position within
+    // their own category, but do NOT block items of other categories from
+    // being reordered around them.
+    let all_items: Vec<Item> = file.items.drain(..).collect();
+    let reordered = reorder_items_to_string(all_items, &src, &line_starts, is_entry_point);
 
-    let mut segments: Vec<Segment> = Vec::new();
-    let mut pending: Vec<Item> = Vec::new();
-    // Byte offset in `src` right after the last iterated item's snippet end.
-    // Used to compute the leading gap for skip items.
-    let mut prev_item_end: Option<usize> = None;
-    // Pre-compute snippet byte ranges for all items so we can look at neighbours.
-    let item_info: Vec<(std::ops::Range<usize>, Item)> = file
-        .items
-        .iter()
-        .map(|item| {
-            let range = item_snippet_byte_range(item, &src, &line_starts);
-            (range, item.clone()) // Item is cheap to clone (it's an AST)
-        })
-        .collect();
-
-    for (i, (item_range, item)) in item_info.into_iter().enumerate() {
-        let snippet_text = src[item_range.clone()].trim_end().to_string();
-
-        if paths::has_rustfmt_skip(item_attributes(&item)) {
-            if !pending.is_empty() {
-                segments.push(Segment::Process(std::mem::take(&mut pending)));
-            }
-            // Capture original leading whitespace between previous item and this skip
-            let leading = match prev_item_end {
-                Some(end) => {
-                    let raw_gap = &src[end..item_range.start];
-                    // Strip one leading \n — the line terminator of the previous
-                    // item, which is already provided by write_bucket.
-                    raw_gap.strip_prefix('\n').unwrap_or(raw_gap).to_string()
-                }
-                None => String::new(),
-            };
-            // Capture original trailing whitespace between this skip and the next item.
-            // If the next item is also a skip, its leading will handle the spacing
-            // so we leave trailing empty to avoid double-counting.
-            let trailing = file
-                .items
-                .get(i + 1)
-                .map(|next| {
-                    if paths::has_rustfmt_skip(item_attributes(next)) {
-                        return String::new();
-                    }
-                    let next_range = item_snippet_byte_range(next, &src, &line_starts);
-                    let raw_gap = &src[item_range.end..next_range.start];
-                    // Strip one leading \n — the line terminator of this skip's
-                    // last line, which is already added by the output builder.
-                    raw_gap.strip_prefix('\n').unwrap_or(raw_gap).to_string()
-                })
-                .unwrap_or_default();
-            segments.push(Segment::Skip {
-                snippet: snippet_text,
-                leading,
-                trailing,
-            });
-            prev_item_end = Some(item_range.end);
-        } else {
-            pending.push(item);
-            prev_item_end = Some(item_range.end);
-        }
-    }
-    if !pending.is_empty() {
-        segments.push(Segment::Process(pending));
-    }
-
-    // Build output from segments
+    // Build output
     let mut out = String::new();
     if let Some(sb) = shebang {
         out.push_str(&sb);
@@ -834,41 +775,8 @@ fn reorder_file(path: &Path) -> Result<()> {
         out.push_str("\n\n");
     }
 
-    let mut wrote_any = !out.is_empty();
-    let mut prev_was_skip = false;
-
-    for segment in segments {
-        match segment {
-            Segment::Skip {
-                snippet,
-                leading,
-                trailing,
-            } => {
-                if wrote_any && !leading.is_empty() {
-                    out.push_str(&leading);
-                }
-                out.push_str(&snippet);
-                out.push('\n');
-                if !trailing.is_empty() {
-                    out.push_str(&trailing);
-                }
-                wrote_any = true;
-                prev_was_skip = true;
-            }
-            Segment::Process(items) => {
-                let reordered = reorder_items_to_string(items, &src, &line_starts, is_entry_point);
-                if !reordered.is_empty() {
-                    if wrote_any && !prev_was_skip {
-                        while !out.ends_with("\n\n") {
-                            out.push('\n');
-                        }
-                    }
-                    out.push_str(&reordered);
-                    wrote_any = true;
-                    prev_was_skip = false;
-                }
-            }
-        }
+    if !reordered.is_empty() {
+        out.push_str(&reordered);
     }
 
     while out.ends_with("\n\n\n") {
@@ -895,6 +803,7 @@ fn reorder_items_to_string(
     line_starts: &[usize],
     is_entry_point: bool,
 ) -> String {
+    // Partition items into struct/enum/union, fn, and other
     let (struct_enum_items, rest_items): (Vec<_>, Vec<_>) = items
         .into_iter()
         .partition(|item| matches!(item, Item::Struct(_) | Item::Enum(_) | Item::Union(_)));
@@ -903,10 +812,21 @@ fn reorder_items_to_string(
         .into_iter()
         .partition(|item| matches!(item, Item::Fn(_)));
 
+    // --- Struct/Enum items ---
+    // Sort by dependencies. Skip items pass through as-is; the dependency
+    // sort preserves their relative order when there are no conflicting deps.
     let sorted_struct_enums = sort_type_items_by_dependencies(struct_enum_items);
 
-    let mut sorted_fn_items = fn_items;
-    sorted_fn_items.sort_by(|a, b| {
+    // --- Fn items ---
+    // Separate skip fns; sort only non-skip fns by visibility then name,
+    // then interleave skip fns at their original relative positions.
+    let mut non_skip_fns: Vec<Item> = fn_items
+        .iter()
+        .filter(|item| !paths::has_rustfmt_skip(item_attributes(item)))
+        .cloned()
+        .collect();
+
+    non_skip_fns.sort_by(|a, b| {
         if is_entry_point {
             let a_is_main = fn_item_name(a) == "main";
             let b_is_main = fn_item_name(b) == "main";
@@ -922,6 +842,21 @@ fn reorder_items_to_string(
             .then_with(|| fn_item_name(a).cmp(&fn_item_name(b)))
     });
 
+    // Merge: walk the original fn order; for skip positions keep the original
+    // fn, for non-skip positions consume from the sorted list.
+    let mut sorted_fn_items: Vec<Item> = Vec::new();
+    let mut ns_idx = 0;
+    for item in &fn_items {
+        if paths::has_rustfmt_skip(item_attributes(item)) {
+            // Keep skip fn at its original position
+            sorted_fn_items.push(item.clone());
+        } else if ns_idx < non_skip_fns.len() {
+            sorted_fn_items.push(non_skip_fns[ns_idx].clone());
+            ns_idx += 1;
+        }
+    }
+
+    // --- Build buckets ---
     let mut buckets: Vec<Vec<BucketItem>> = (0..14).map(|_| Vec::new()).collect();
 
     let impl_items = collect_impls_and_bucket_rest(other_items, &mut buckets, src, line_starts);
@@ -936,12 +871,15 @@ fn reorder_items_to_string(
 
     for item in sorted_fn_items.into_iter() {
         let snippet = item_snippet(&item, src, line_starts);
+        let is_skip = paths::has_rustfmt_skip(item_attributes(&item));
         buckets[11].push(BucketItem {
             sort_key: item_sort_key(&item),
             snippet,
+            is_skip,
         });
     }
 
+    // --- Write output ---
     let mut out = String::new();
     let mut wrote_any = false;
 
@@ -1117,7 +1055,35 @@ fn write_bucket(
     if category == 9 || category == 10 || category == 13 {
         // These buckets carry their semantic order from earlier grouping.
     } else if category != 11 {
-        bucket.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+        // Sort non-skip items; skip items stay at their original relative
+        // position within this category (they act as barriers within the
+        // category but not across categories).
+        let mut skip_positions: Vec<(usize, BucketItem)> = Vec::new();
+        let mut non_skip: Vec<BucketItem> = Vec::new();
+
+        for (idx, item) in bucket.drain(..).enumerate() {
+            if item.is_skip {
+                skip_positions.push((idx, item));
+            } else {
+                non_skip.push(item);
+            }
+        }
+
+        non_skip.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+
+        // Interleave skip items at their original positions within the bucket
+        let total = skip_positions.len() + non_skip.len();
+        let mut ns_idx = 0;
+        let mut sk_idx = 0;
+        for pos in 0..total {
+            if sk_idx < skip_positions.len() && skip_positions[sk_idx].0 == pos {
+                bucket.push(skip_positions[sk_idx].1.clone());
+                sk_idx += 1;
+            } else {
+                bucket.push(non_skip[ns_idx].clone());
+                ns_idx += 1;
+            }
+        }
     }
 
     if *wrote_any && category != 0 {
@@ -1131,27 +1097,42 @@ fn write_bucket(
     let bucket_len = bucket.len();
 
     if matches!(category, 0..=2) {
-        let snippets: Vec<_> = bucket
-            .drain(..)
+        // Separate skip items — they should not be merged into use trees
+        let skip_snippets: Vec<_> = bucket
+            .iter()
+            .filter(|item| item.is_skip)
             .map(|item| item.snippet.trim_end_matches('\n').to_string())
             .collect();
 
-        if let Some(merged) = merge_use_trees(&snippets) {
-            for use_stmt in merged {
-                out.push_str("use ");
-                out.push_str(&use_stmt);
-                out.push_str(";\n");
-            }
-        } else {
-            for (i, snippet) in snippets.iter().enumerate() {
-                out.push_str(snippet);
-                out.push('\n');
-                if i + 1 < snippets.len() {
-                    for _ in 0..extra_blank {
-                        out.push('\n');
+        let non_skip_snippets: Vec<_> = bucket
+            .drain(..)
+            .filter(|item| !item.is_skip)
+            .map(|item| item.snippet.trim_end_matches('\n').to_string())
+            .collect();
+
+        if !non_skip_snippets.is_empty() {
+            if let Some(merged) = merge_use_trees(&non_skip_snippets) {
+                for use_stmt in merged {
+                    out.push_str("use ");
+                    out.push_str(&use_stmt);
+                    out.push_str(";\n");
+                }
+            } else {
+                for (i, snippet) in non_skip_snippets.iter().enumerate() {
+                    out.push_str(snippet);
+                    out.push('\n');
+                    if i + 1 < non_skip_snippets.len() {
+                        for _ in 0..extra_blank {
+                            out.push('\n');
+                        }
                     }
                 }
             }
+        }
+
+        for snippet in &skip_snippets {
+            out.push_str(snippet);
+            out.push('\n');
         }
     } else {
         for (i, item) in bucket.drain(..).enumerate() {

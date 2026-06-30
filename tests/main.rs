@@ -929,19 +929,27 @@ pub fn run() {}
 
     let result = run_reorder(&path);
 
-    // Skipped struct should remain between the two use groups and the fn
+    // Use statements should be merged and placed before the skip struct
+    // (category ordering takes priority; #[rustfmt::skip] only preserves
+    // formatting, not position across categories).
+    let use_pos = result.find("use std::").expect("merged use not found");
     let skip_pos = result
         .find("#[rustfmt::skip]")
         .expect("skip attr not found");
-    let use_fs_pos = result.find("use std::fs;").expect("use std::fs not found");
     let fn_pos = result.find("pub fn run").expect("fn not found");
+
     assert!(
-        skip_pos < use_fs_pos,
-        "skip before use std::fs: skip at {skip_pos}, use at {use_fs_pos}"
+        use_pos < skip_pos,
+        "merged use before skip: use at {use_pos}, skip at {skip_pos}"
     );
     assert!(
         skip_pos < fn_pos,
         "skip before fn: skip at {skip_pos}, fn at {fn_pos}"
+    );
+    // Verify uses are merged
+    assert!(
+        result.contains("std::{\n    collections::HashMap,\n    fs,\n"),
+        "uses should be merged: {result}"
     );
     // Verify indentation is preserved (not rustfmt'd)
     assert!(
@@ -1110,5 +1118,61 @@ impl Bar {
     assert!(
         result.contains("  pub fn new"),
         "skip impl should preserve original indentation"
+    );
+}
+
+#[test]
+fn test_use_moves_before_mods_across_skip_mod() {
+    let path = test_dir().join("use_before_skip_mod.rs");
+    fs::write(
+        &path,
+        "\
+pub mod codec;
+
+#[allow(warnings)]
+#[rustfmt::skip]
+pub mod fbs;
+
+pub mod log;
+
+use selium_guest_macros::schema;
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    // `use` should float to the top, before all `pub mod` declarations,
+    // even though one of the mods has #[rustfmt::skip].
+    let use_pos = result
+        .find("use selium_guest_macros")
+        .expect("use statement not found");
+    let codec_pos = result.find("pub mod codec").expect("codec not found");
+    let skip_pos = result
+        .find("#[rustfmt::skip]")
+        .expect("skip attr not found");
+    let fbs_pos = result.find("pub mod fbs;").expect("fbs not found");
+    let log_pos = result.find("pub mod log").expect("log not found");
+
+    assert!(
+        use_pos < codec_pos,
+        "use before codec: use at {use_pos}, codec at {codec_pos}"
+    );
+    assert!(
+        codec_pos < skip_pos,
+        "codec before skip: codec at {codec_pos}, skip at {skip_pos}"
+    );
+    assert!(
+        skip_pos < fbs_pos,
+        "skip attr before fbs mod: skip at {skip_pos}, fbs at {fbs_pos}"
+    );
+    assert!(
+        fbs_pos < log_pos,
+        "fbs before log: fbs at {fbs_pos}, log at {log_pos}"
+    );
+    // The skip mod's attributes should be preserved
+    assert!(
+        result.contains("#[allow(warnings)]"),
+        "allow(warnings) attr should be preserved"
     );
 }
