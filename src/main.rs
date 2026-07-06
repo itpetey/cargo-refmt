@@ -298,7 +298,7 @@ fn header_to_string(attrs: &[Attribute], src: &str, line_starts: &[usize]) -> St
     let mut end = 0usize;
 
     for attr in attrs {
-        let range = span_range(attr.span(), line_starts, src.len());
+        let range = span_range(attr.span(), src, line_starts);
         start = start.min(range.start);
         end = end.max(range.end);
     }
@@ -464,10 +464,10 @@ fn item_snippet_byte_range(
     src: &str,
     line_starts: &[usize],
 ) -> std::ops::Range<usize> {
-    let mut range = span_range(item.span(), line_starts, src.len());
+    let mut range = span_range(item.span(), src, line_starts);
 
     for attr in item_attributes(item) {
-        let attr_range = span_range(attr.span(), line_starts, src.len());
+        let attr_range = span_range(attr.span(), src, line_starts);
         if attr_range.start < range.start {
             range.start = attr_range.start;
         }
@@ -943,16 +943,13 @@ fn sort_type_items_by_dependencies(items: Vec<Item>) -> Vec<Item> {
     sorted
 }
 
-fn span_range(
-    span: proc_macro2::Span,
-    line_starts: &[usize],
-    src_len: usize,
-) -> std::ops::Range<usize> {
-    let start = span.start();
-    let end = span.end();
+fn span_range(span: proc_macro2::Span, src: &str, line_starts: &[usize]) -> std::ops::Range<usize> {
+    let src_len = src.len();
+    let start_lc = span.start();
+    let end_lc = span.end();
 
-    let start_line_index = start.line.saturating_sub(1);
-    let end_line_index = end.line.saturating_sub(1);
+    let start_line_index = start_lc.line.saturating_sub(1);
+    let end_line_index = end_lc.line.saturating_sub(1);
 
     let start_line_base = line_starts
         .get(start_line_index)
@@ -960,8 +957,29 @@ fn span_range(
         .unwrap_or(src_len);
     let end_line_base = line_starts.get(end_line_index).copied().unwrap_or(src_len);
 
-    let mut start_idx = start_line_base.saturating_add(start.column);
-    let mut end_idx = end_line_base.saturating_add(end.column);
+    // proc-macro2's LineColumn.column is a character (Unicode scalar) offset
+    // from the start of the line, NOT a byte offset. When the source contains
+    // multi-byte UTF-8 characters (e.g. —, –, or other non-ASCII codepoints),
+    // the character count diverges from the byte count and we must convert
+    // by walking the actual source text of the line.
+    //
+    // See https://github.com/dtolnay/proc-macro2/issues/347
+    fn char_col_to_byte_offset(src: &str, line_base: usize, column: usize) -> usize {
+        let line = &src[line_base..];
+        // Find the first newline or end of string to bound the line
+        let line_end = line.bytes().position(|b| b == b'\n').unwrap_or(line.len());
+        let line_content = &line[..line_end];
+        // Walk characters to find the byte offset of the given character position
+        let byte_offset = line_content
+            .char_indices()
+            .nth(column)
+            .map(|(i, _)| i)
+            .unwrap_or(line_content.len());
+        line_base + byte_offset
+    }
+
+    let mut start_idx = char_col_to_byte_offset(src, start_line_base, start_lc.column);
+    let mut end_idx = char_col_to_byte_offset(src, end_line_base, end_lc.column);
 
     if start_idx > src_len {
         start_idx = src_len;
