@@ -79,6 +79,25 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Whether a `use` snippet is safe to merge into a compressed use tree.
+///
+/// Only plain `use` statements (inherited visibility, no attributes) can be
+/// merged: merging regenerates the statement from the parsed tree, so any
+/// explicit visibility (e.g. `pub(crate) use ...`) or attribute would be
+/// silently dropped. Such statements must be preserved verbatim instead.
+fn can_merge_use(snippet: &str) -> bool {
+    let Ok(file) = syn::parse_file(snippet) else {
+        return false;
+    };
+    let Some(item) = file.items.into_iter().next() else {
+        return false;
+    };
+    let Item::Use(use_item) = item else {
+        return false;
+    };
+    use_item.attrs.is_empty() && matches!(use_item.vis, syn::Visibility::Inherited)
+}
+
 fn blank_lines_after(category: usize) -> usize {
     match category {
         0..=7 => 0,
@@ -1122,24 +1141,27 @@ fn write_bucket(
             .map(|item| item.snippet.trim_end_matches('\n').to_string())
             .collect();
 
-        let non_skip_snippets: Vec<_> = bucket
+        // Only plain `use` statements (inherited visibility, no attributes)
+        // may be merged — merging regenerates the statement and would drop
+        // explicit visibility such as `pub(crate)`.
+        let (mergeable_snippets, kept_snippets): (Vec<_>, Vec<_>) = bucket
             .drain(..)
             .filter(|item| !item.is_skip)
             .map(|item| item.snippet.trim_end_matches('\n').to_string())
-            .collect();
+            .partition(|snippet| can_merge_use(snippet));
 
-        if !non_skip_snippets.is_empty() {
-            if let Some(merged) = merge_use_trees(&non_skip_snippets) {
+        if !mergeable_snippets.is_empty() {
+            if let Some(merged) = merge_use_trees(&mergeable_snippets) {
                 for use_stmt in merged {
                     out.push_str("use ");
                     out.push_str(&use_stmt);
                     out.push_str(";\n");
                 }
             } else {
-                for (i, snippet) in non_skip_snippets.iter().enumerate() {
+                for (i, snippet) in mergeable_snippets.iter().enumerate() {
                     out.push_str(snippet);
                     out.push('\n');
-                    if i + 1 < non_skip_snippets.len() {
+                    if i + 1 < mergeable_snippets.len() {
                         for _ in 0..extra_blank {
                             out.push('\n');
                         }
@@ -1148,7 +1170,7 @@ fn write_bucket(
             }
         }
 
-        for snippet in &skip_snippets {
+        for snippet in kept_snippets.iter().chain(skip_snippets.iter()) {
             out.push_str(snippet);
             out.push('\n');
         }

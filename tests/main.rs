@@ -138,6 +138,72 @@ use std::fs::File;
 }
 
 #[test]
+fn test_pub_crate_use_visibility_preserved() {
+    let path = test_dir().join("pub_crate_use.rs");
+    fs::write(
+        &path,
+        "\
+pub(crate) use shared_memory::SharedWaiter;
+
+pub use atomic_op::ATOMIC_OPS;
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert!(
+        result.contains("pub(crate) use shared_memory::SharedWaiter;"),
+        "pub(crate) visibility should be preserved: {result}"
+    );
+}
+
+#[test]
+fn test_pub_crate_use_not_merged_with_plain_uses() {
+    let path = test_dir().join("pub_crate_use_mixed.rs");
+    fs::write(
+        &path,
+        "\
+pub(crate) use shared_memory::SharedTable;
+use shared_memory::SharedRegion;
+use shared_memory::SharedWaiter;
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert!(
+        result.contains("pub(crate) use shared_memory::SharedTable;"),
+        "pub(crate) use should be kept separate with visibility: {result}"
+    );
+    assert!(
+        result.contains("use shared_memory::{"),
+        "plain uses should still be merged: {result}"
+    );
+}
+
+#[test]
+fn test_pub_super_use_visibility_preserved() {
+    let path = test_dir().join("pub_super_use.rs");
+    fs::write(
+        &path,
+        "\
+pub(super) use shared_memory::SharedWaiter;
+use shared_memory::SharedRegion;
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert!(
+        result.contains("pub(super) use shared_memory::SharedWaiter;"),
+        "pub(super) visibility should be preserved: {result}"
+    );
+}
+
+#[test]
 fn test_constants_no_blank_lines() {
     let path = test_dir().join("constants.rs");
     fs::write(
