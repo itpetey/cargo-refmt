@@ -4,17 +4,17 @@ use std::{
     process::Command,
 };
 
-fn cargo_bin() -> std::path::PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("debug")
-        .join("cargo-refmt")
+fn cargo_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_cargo-refmt"))
 }
 
 fn run_reorder(path: &Path) -> String {
     let bin_path = cargo_bin();
     let output = Command::new(&bin_path)
         .arg(path)
+        // Keep the binary's final `cargo fmt` from touching this repository
+        // while tests run in parallel.
+        .current_dir(path.parent().unwrap_or_else(|| Path::new(".")))
         .output()
         .unwrap_or_else(|e| panic!("failed to run reorder at {:?}: {}", bin_path, e));
     assert!(
@@ -1241,4 +1241,216 @@ use selium_guest_macros::schema;
         result.contains("#[allow(warnings)]"),
         "allow(warnings) attr should be preserved"
     );
+}
+
+#[test]
+fn test_preserves_trailing_comments() {
+    let path = test_dir().join("trailing_comments.rs");
+    fs::write(
+        &path,
+        "\
+use std::fs;
+
+pub fn run() {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn it_works() {}
+}
+
+// --- Spec traceability -----------------------------------------------
+// These tests are the evidence for the scenarios.
+// scenario: example/one
+// scenario: example/two
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert!(
+        result.contains("// --- Spec traceability"),
+        "trailing comment block should be preserved: {result}"
+    );
+    assert!(
+        result.contains("// scenario: example/one"),
+        "trailing scenario comments should be preserved: {result}"
+    );
+    assert!(
+        result.contains("// scenario: example/two"),
+        "trailing scenario comments should be preserved: {result}"
+    );
+    assert!(
+        result.trim_end().ends_with("// scenario: example/two"),
+        "trailing comment block should stay at the end: {result}"
+    );
+}
+
+#[test]
+fn test_preserves_orphan_comments_between_items() {
+    let path = test_dir().join("orphan_comments.rs");
+    fs::write(
+        &path,
+        "\
+use std::fs;
+
+// Section heading
+
+pub fn run() {}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert!(
+        result.contains("// Section heading"),
+        "comment separated from the following item by a blank line should be preserved: {result}"
+    );
+}
+
+#[test]
+fn test_preserves_inline_trailing_comments() {
+    let path = test_dir().join("inline_comments.rs");
+    fs::write(
+        &path,
+        "\
+use std::fs; // import comment
+
+pub const A: i32 = 1; // const comment
+
+pub fn run() {} // fn comment
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert!(
+        result.contains("use std::fs; // import comment"),
+        "use trailing comment should be preserved: {result}"
+    );
+    assert!(
+        result.contains("pub const A: i32 = 1; // const comment"),
+        "const trailing comment should be preserved: {result}"
+    );
+    assert!(
+        result.contains("pub fn run() {} // fn comment"),
+        "fn trailing comment should be preserved: {result}"
+    );
+}
+
+#[test]
+fn test_preserves_block_comments_without_duplicating_them() {
+    let path = test_dir().join("block_comments.rs");
+    fs::write(
+        &path,
+        "\
+pub fn b() {} /* trailing block */
+
+/* attached block */
+pub fn c() {}
+
+pub fn d() {} /* trailing
+ * multi-line
+ */
+
+fn e() {}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert_eq!(
+        result.matches("/* trailing block */").count(),
+        1,
+        "inline trailing block comment should be emitted exactly once: {result}"
+    );
+    assert_eq!(
+        result.matches("/* attached block */").count(),
+        1,
+        "attached block comment should be emitted exactly once: {result}"
+    );
+    assert_eq!(
+        result.matches("/* trailing\n * multi-line\n */").count(),
+        1,
+        "multi-line trailing block comment should be emitted exactly once: {result}"
+    );
+    assert!(
+        result.contains("/* attached block */\npub fn c()"),
+        "attached block comment should stay with its item: {result}"
+    );
+}
+
+#[test]
+fn test_preserves_leading_file_header() {
+    let path = test_dir().join("leading_header.rs");
+    fs::write(
+        &path,
+        "\
+// Licence header
+
+fn zebra() {}
+
+use std::fs;
+
+pub fn run() {}
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert!(
+        result.starts_with("// Licence header"),
+        "file header should stay at the top: {result}"
+    );
+    assert!(
+        result.contains("// Licence header"),
+        "file header should be preserved: {result}"
+    );
+}
+
+#[test]
+fn test_preserves_comments_on_use_statements() {
+    let path = test_dir().join("use_comments.rs");
+    fs::write(
+        &path,
+        "\
+// why this import
+use std::fs;
+
+use std::path::Path;
+",
+    )
+    .expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert!(
+        result.contains("// why this import"),
+        "comment attached to a use statement should be preserved: {result}"
+    );
+    assert!(
+        result.contains("use std::fs;"),
+        "use with a comment should not be lost while merging: {result}"
+    );
+}
+
+#[test]
+fn test_preserves_file_with_only_comments() {
+    let path = test_dir().join("only_comments.rs");
+    let src = "\
+// Only comments
+// in this file
+
+/* block comment */
+";
+    fs::write(&path, src).expect("failed to write test file");
+
+    let result = run_reorder(&path);
+
+    assert_eq!(result, src, "a file with no items should be left untouched");
 }

@@ -61,14 +61,11 @@ impl InputCollector {
             .with_context(|| format!("inspect metadata for {}", path.display()))?;
 
         if metadata.is_dir() {
-            if self.is_ignored(path, true) {
-                return Ok(());
+            if !self.is_ignored(path, true) {
+                self.collect_directory(path, files, seen)?;
             }
-            self.collect_directory(path, files, seen)?;
-        } else if metadata.is_file() {
-            if !self.is_ignored(path, false) {
-                push_file(path.to_path_buf(), files, seen);
-            }
+        } else if metadata.is_file() && !self.is_ignored(path, false) {
+            push_file(path.to_path_buf(), files, seen);
         }
 
         Ok(())
@@ -195,6 +192,43 @@ pub(crate) fn has_rustfmt_skip(attrs: &[Attribute]) -> bool {
     })
 }
 
+/// Whether `path` is a crate root. Crate roots resolve child modules relative
+/// to their own directory; ordinary file modules resolve them relative to a
+/// directory named after the module file.
+fn is_crate_root(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+
+    if matches!(stem, "lib" | "main" | "mod" | "build") {
+        return true;
+    }
+
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+
+    // Custom crate roots (`[[bin]] path = ...`) live at the package root, as
+    // do integration tests, examples and benchmarks.
+    parent.join("Cargo.toml").is_file()
+        || parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|dir| matches!(dir, "bin" | "tests" | "examples" | "benches"))
+}
+
+/// The directory that child modules of `containing_file` are resolved from.
+fn module_base_dir(containing_file: &Path) -> Option<PathBuf> {
+    let parent = containing_file.parent()?;
+
+    if is_crate_root(containing_file) {
+        Some(parent.to_path_buf())
+    } else {
+        let stem = containing_file.file_stem()?.to_str()?;
+        Some(parent.join(stem))
+    }
+}
+
 /// Resolve a `mod name;` declaration to the filesystem path that should be
 /// skipped when the declaration carries `#[rustfmt::skip]`.
 ///
@@ -202,22 +236,22 @@ pub(crate) fn has_rustfmt_skip(attrs: &[Attribute]) -> bool {
 /// the file path for a file module (`path/name.rs`), or `None` if the
 /// module is inline (no external file).
 fn resolve_module_path(containing_file: &Path, mod_name: &str) -> Option<PathBuf> {
-    let parent = containing_file.parent()?;
+    let base = module_base_dir(containing_file)?;
 
-    // Directory module: parent/name/mod.rs  → skip parent/name/
-    let mod_rs = parent.join(mod_name).join("mod.rs");
+    // Directory module: base/name/mod.rs  → skip base/name/
+    let mod_rs = base.join(mod_name).join("mod.rs");
     if mod_rs.exists() {
-        return Some(parent.join(mod_name));
+        return Some(base.join(mod_name));
     }
 
-    // File module: parent/name.rs  → skip that file
-    let rs_file = parent.join(format!("{}.rs", mod_name));
+    // File module: base/name.rs  → skip that file
+    let rs_file = base.join(format!("{}.rs", mod_name));
     if rs_file.exists() {
         return Some(rs_file);
     }
 
     // Directory exists (edition 2024 inline module directory)
-    let dir = parent.join(mod_name);
+    let dir = base.join(mod_name);
     if dir.is_dir() {
         return Some(dir);
     }
@@ -248,12 +282,11 @@ pub fn collect_skipped_module_paths(files: &[PathBuf]) -> Result<HashSet<PathBuf
 
         // Check for #[rustfmt::skip] on module items
         for item in &file.items {
-            if let Item::Mod(mod_item) = item {
-                if has_rustfmt_skip(&mod_item.attrs) {
-                    if let Some(resolved) = resolve_module_path(path, &mod_item.ident.to_string()) {
-                        skipped.insert(resolved);
-                    }
-                }
+            if let Item::Mod(mod_item) = item
+                && has_rustfmt_skip(&mod_item.attrs)
+                && let Some(resolved) = resolve_module_path(path, &mod_item.ident.to_string())
+            {
+                skipped.insert(resolved);
             }
         }
     }
@@ -402,15 +435,81 @@ mod tests {
         fs::create_dir(root.join("sub")).unwrap();
         fs::write(root.join("sub/mod.rs"), "fn a() {}\n").unwrap();
         fs::write(
-            root.join("parent.rs"),
+            root.join("lib.rs"),
             "#[rustfmt::skip]\nmod sub;\nfn b() {}\n",
         )
         .unwrap();
 
-        let files = vec![root.join("parent.rs")];
+        let files = vec![root.join("lib.rs")];
         let skipped = collect_skipped_module_paths(&files).unwrap();
 
         assert!(skipped.contains(&root.join("sub")));
+    }
+
+    #[test]
+    fn test_collect_skipped_module_paths_in_file_module() {
+        let dir = temp_dir();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("src/foo")).unwrap();
+        fs::write(root.join("src/foo/bar.rs"), "fn a() {}\n").unwrap();
+        fs::write(
+            root.join("src/foo.rs"),
+            "#[rustfmt::skip]\nmod bar;\nfn b() {}\n",
+        )
+        .unwrap();
+
+        let files = vec![root.join("src/foo.rs")];
+        let skipped = collect_skipped_module_paths(&files).unwrap();
+
+        assert!(
+            skipped.contains(&root.join("src/foo/bar.rs")),
+            "module declared in a file module should resolve inside its module directory: {skipped:?}"
+        );
+    }
+
+    #[test]
+    fn test_collect_skipped_module_paths_does_not_skip_sibling_module() {
+        let dir = temp_dir();
+        let root = dir.path();
+
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/bar.rs"), "fn a() {}\n").unwrap();
+        fs::write(
+            root.join("src/foo.rs"),
+            "#[rustfmt::skip]\nmod bar;\nfn b() {}\n",
+        )
+        .unwrap();
+
+        let files = vec![root.join("src/foo.rs")];
+        let skipped = collect_skipped_module_paths(&files).unwrap();
+
+        assert!(
+            !skipped.contains(&root.join("src/bar.rs")),
+            "a sibling module must not be skipped for a declaration in foo.rs: {skipped:?}"
+        );
+    }
+
+    #[test]
+    fn test_collect_skipped_module_paths_in_custom_crate_root() {
+        let dir = temp_dir();
+        let root = dir.path();
+
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        fs::write(root.join("sub.rs"), "fn a() {}\n").unwrap();
+        fs::write(
+            root.join("cli.rs"),
+            "#[rustfmt::skip]\nmod sub;\nfn main() {}\n",
+        )
+        .unwrap();
+
+        let files = vec![root.join("cli.rs")];
+        let skipped = collect_skipped_module_paths(&files).unwrap();
+
+        assert!(
+            skipped.contains(&root.join("sub.rs")),
+            "a custom crate root should resolve child modules next to itself: {skipped:?}"
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ use syn::{Attribute, File, Item, spanned::Spanned, visit::Visit};
 mod paths;
 
 type Cat = usize;
+type SnippetMap = HashMap<usize, String>;
 
 #[derive(Parser)]
 #[command(name = "refmt")]
@@ -81,11 +82,18 @@ fn main() -> Result<()> {
 
 /// Whether a `use` snippet is safe to merge into a compressed use tree.
 ///
-/// Only plain `use` statements (inherited visibility, no attributes) can be
-/// merged: merging regenerates the statement from the parsed tree, so any
-/// explicit visibility (e.g. `pub(crate) use ...`) or attribute would be
-/// silently dropped. Such statements must be preserved verbatim instead.
+/// Only plain `use` statements (inherited visibility, no attributes, no
+/// comments) can be merged: merging regenerates the statement from the parsed
+/// tree, so any explicit visibility (e.g. `pub(crate) use ...`), attribute or
+/// comment would be silently dropped. Such statements must be preserved
+/// verbatim instead.
 fn can_merge_use(snippet: &str) -> bool {
+    // Comments are not represented in the parsed use tree, so a snippet that
+    // contains one cannot be regenerated without losing it.
+    if snippet.contains("//") || snippet.contains("/*") {
+        return false;
+    }
+
     let Ok(file) = syn::parse_file(snippet) else {
         return false;
     };
@@ -99,12 +107,7 @@ fn can_merge_use(snippet: &str) -> bool {
 }
 
 fn blank_lines_after(category: usize) -> usize {
-    match category {
-        0..=7 => 0,
-        8..=12 => 1,
-        13 => 1,
-        _ => 1,
-    }
+    usize::from(category >= 8)
 }
 
 fn category(item: &Item) -> Cat {
@@ -155,6 +158,7 @@ fn category(item: &Item) -> Cat {
 fn collect_impls_and_bucket_rest(
     items: Vec<Item>,
     buckets: &mut [Vec<BucketItem>],
+    snippets: &SnippetMap,
     src: &str,
     line_starts: &[usize],
 ) -> Vec<(bool, ImplSnippet)> {
@@ -177,14 +181,14 @@ fn collect_impls_and_bucket_rest(
                     target: impl_type_name(impl_item),
                     sort_category: impl_sort_category(impl_item, &local_traits),
                     source_order,
-                    snippet: item_snippet(&item, src, line_starts),
+                    snippet: item_snippet(&item, snippets, src, line_starts),
                 },
             ));
         } else {
             let cat = category(&item);
             buckets[cat].push(BucketItem {
                 sort_key: item_sort_key(&item),
-                snippet: item_snippet(&item, src, line_starts),
+                snippet: item_snippet(&item, snippets, src, line_starts),
                 is_skip,
             });
         }
@@ -322,13 +326,17 @@ fn header_to_string(attrs: &[Attribute], src: &str, line_starts: &[usize]) -> St
         end = end.max(range.end);
     }
 
+    // Include any comments that precede the crate-level attributes (for
+    // example a licence header) rather than dropping them.
+    start = preceding_comment_start(src, start);
+
     src[start..end].to_string()
 }
 
 fn impl_sort_category(impl_item: &syn::ItemImpl, local_traits: &HashSet<String>) -> usize {
     match &impl_item.trait_ {
         None => 0,
-        Some((_, trait_path, _)) => {
+        Some((trait_path, _)) => {
             if is_rust_trait(trait_path, local_traits) {
                 2
             } else {
@@ -471,13 +479,88 @@ fn item_is_public_type(item: &Item) -> bool {
     }
 }
 
-fn item_snippet(item: &Item, src: &str, line_starts: &[usize]) -> String {
-    let range = item_snippet_byte_range(item, src, line_starts);
-    src[range].trim_end().to_string()
+fn item_key(item: &Item, src: &str, line_starts: &[usize]) -> usize {
+    span_range(item.span(), src, line_starts).start
+}
+
+/// The start of an item including any attributes attached to it, but not
+/// including preceding comments.
+fn item_base_start(item: &Item, src: &str, line_starts: &[usize]) -> usize {
+    let mut start = span_range(item.span(), src, line_starts).start;
+    for attr in item_attributes(item) {
+        let attr_start = span_range(attr.span(), src, line_starts).start;
+        start = start.min(attr_start);
+    }
+    start
+}
+
+/// Returns the start of the comments attached directly to the first item.
+/// Comments separated from the first item by a blank line are file-level
+/// header comments and are emitted separately, so that reordering the first
+/// item does not drag the header into the middle of the file.
+fn first_item_attached_start(items: &[Item], src: &str, line_starts: &[usize]) -> Option<usize> {
+    let first = items.first()?;
+    Some(preceding_comment_start_impl(
+        src,
+        item_base_start(first, src, line_starts),
+        false,
+    ))
+}
+
+fn build_item_snippets(items: &[Item], src: &str, line_starts: &[usize]) -> SnippetMap {
+    let first_attached_start = first_item_attached_start(items, src, line_starts);
+    let mut snippets = HashMap::with_capacity(items.len());
+
+    for (index, item) in items.iter().enumerate() {
+        let mut range = item_snippet_byte_range(item, src, line_starts);
+        if index == 0
+            && let Some(start) = first_attached_start
+        {
+            range.start = start;
+        }
+
+        snippets.insert(
+            item_key(item, src, line_starts),
+            src[range].trim_end().to_string(),
+        );
+    }
+
+    snippets
+}
+
+fn item_snippet(item: &Item, snippets: &SnippetMap, src: &str, line_starts: &[usize]) -> String {
+    snippets
+        .get(&item_key(item, src, line_starts))
+        .cloned()
+        .unwrap_or_else(|| {
+            src[item_snippet_byte_range(item, src, line_starts)]
+                .trim_end()
+                .to_string()
+        })
+}
+
+/// Returns any comments (and other trivia) that follow the final item in the
+/// file. These have no following item to attach to, so they are emitted at the
+/// end of the reordered output instead of being dropped.
+fn trailing_comments_after_last_item(
+    items: &[Item],
+    src: &str,
+    line_starts: &[usize],
+) -> Option<String> {
+    let last = items.last()?;
+    let range = item_snippet_byte_range(last, src, line_starts);
+    let trailing = src[range.end..].trim_start();
+
+    if trailing.trim().is_empty() {
+        None
+    } else {
+        Some(trailing.to_string())
+    }
 }
 
 /// Returns the byte range of the item's snippet in the original source,
-/// extended backward to include any preceding attributes and comments.
+/// extended to include any preceding attributes and comments as well as a
+/// trailing comment on the item's final line.
 fn item_snippet_byte_range(
     item: &Item,
     src: &str,
@@ -494,16 +577,73 @@ fn item_snippet_byte_range(
 
     range.start = range.start.min(range.end);
 
-    // Extend range backward to include any immediately preceding comments
+    // Extend range backward to include any comments that precede the item.
     range.start = preceding_comment_start(src, range.start);
+
+    // Extend range forward to include a comment on the same line as the
+    // item's final token (e.g. `const A: u8 = 1; // explanation`).
+    range.end = trailing_comment_end(src, range.end);
 
     range
 }
 
+/// Extend `end` to cover a trailing comment that starts on the same line as
+/// the item's final token. Returns `end` unchanged when the rest of the line
+/// is not a comment.
+fn trailing_comment_end(src: &str, end: usize) -> usize {
+    let mut cursor = end;
+
+    loop {
+        let line_end = src[cursor..]
+            .find('\n')
+            .map(|offset| cursor + offset)
+            .unwrap_or(src.len());
+        let rest = &src[cursor..line_end];
+        let trimmed = rest.trim_start();
+
+        if trimmed.starts_with("//") {
+            return line_end;
+        }
+
+        if !trimmed.starts_with("/*") {
+            return if cursor == end { end } else { cursor };
+        }
+
+        let comment_start = cursor + (rest.len() - trimmed.len());
+        let Some(close) = src[comment_start..].find("*/") else {
+            return if cursor == end { end } else { cursor };
+        };
+        let after = comment_start + close + 2;
+
+        let after_line_end = src[after..]
+            .find('\n')
+            .map(|offset| after + offset)
+            .unwrap_or(src.len());
+        let after_trimmed = src[after..after_line_end].trim_start();
+
+        if after_trimmed.starts_with("//") {
+            return after_line_end;
+        }
+        if after_trimmed.starts_with("/*") {
+            cursor = after;
+            continue;
+        }
+
+        return after;
+    }
+}
+
 /// Walk backward from `start` to find where preceding line comments begin.
-/// Returns the byte offset of the first comment line that is part of the
-/// contiguous block of comments immediately before `start`.
+/// Returns the byte offset of the first comment line in the block of comments
+/// immediately before `start`. Blank lines between comments are skipped so
+/// that comment blocks separated from the item (or from each other) are still
+/// preserved. The returned offset is only moved when a comment is found, so a
+/// gap that contains no comments does not pull in the preceding item.
 fn preceding_comment_start(src: &str, start: usize) -> usize {
+    preceding_comment_start_impl(src, start, true)
+}
+
+fn preceding_comment_start_impl(src: &str, start: usize, skip_blank_lines: bool) -> usize {
     // Find the start of the line containing `start`
     let line_start = src[..start].rfind('\n').map(|pos| pos + 1).unwrap_or(0);
 
@@ -530,14 +670,32 @@ fn preceding_comment_start(src: &str, start: usize) -> usize {
             comment_block_start = prev_line_start;
             current_line_start = prev_line_start;
         } else if trimmed.is_empty() {
-            // Blank line - stop looking
-            break;
+            // Blank line. When looking for comments that belong to an item,
+            // keep scanning: a comment block separated from the item by a
+            // blank line should still be preserved (and move with it).
+            if skip_blank_lines {
+                current_line_start = prev_line_start;
+            } else {
+                break;
+            }
         } else if trimmed.ends_with("*/") {
-            // End of a block comment - find its start
-            if let Some(block_start) = find_block_comment_start(src, prev_line_start, prev_line_end)
-            {
-                comment_block_start = block_start;
-                current_line_start = block_start;
+            // End of a block comment - find its start. A block comment that
+            // begins after code on its opening line trails the previous item
+            // (and is already part of that item's snippet); it should not be
+            // attached to this item as well.
+            if let Some(block_start) = find_block_comment_start(src, prev_line_end) {
+                let block_line_start = src[..block_start]
+                    .rfind('\n')
+                    .map(|pos| pos + 1)
+                    .unwrap_or(0);
+                let before_block = &src[block_line_start..block_start];
+
+                if before_block.trim().is_empty() {
+                    comment_block_start = block_start;
+                    current_line_start = block_start;
+                } else {
+                    break;
+                }
             } else {
                 break;
             }
@@ -552,11 +710,8 @@ fn preceding_comment_start(src: &str, start: usize) -> usize {
 
 /// Find the start of a block comment that ends at or before `end`.
 /// Searches backward from `end` through the source to find the opening `/*`.
-fn find_block_comment_start(src: &str, _search_start: usize, end: usize) -> Option<usize> {
-    // Search backward through the entire source up to `end` for the opening /*
-    let search_region = &src[..end];
-    let pos = search_region.rfind("/*")?;
-    Some(pos)
+fn find_block_comment_start(src: &str, end: usize) -> Option<usize> {
+    src[..end].rfind("/*")
 }
 
 fn item_sort_key(item: &Item) -> String {
@@ -656,7 +811,7 @@ fn merge_use_trees(snippets: &[String]) -> Option<Vec<String>> {
                     items.push(subtree);
                 }
             }
-            items.sort_by(|a, b| use_path_to_string(a).cmp(&use_path_to_string(b)));
+            items.sort_by_key(use_path_to_string);
             let mut punctuated: syn::punctuated::Punctuated<syn::UseTree, syn::Token![,]> =
                 syn::punctuated::Punctuated::new();
             for item in items {
@@ -732,6 +887,7 @@ fn push_ordered_impls(
 fn push_type_items(
     items: Vec<Item>,
     buckets: &mut [Vec<BucketItem>],
+    snippets: &SnippetMap,
     src: &str,
     line_starts: &[usize],
 ) {
@@ -739,7 +895,7 @@ fn push_type_items(
         let is_skip = paths::has_rustfmt_skip(item_attributes(&item));
         buckets[9].push(BucketItem {
             sort_key: item_sort_key(&item),
-            snippet: item_snippet(&item, src, line_starts),
+            snippet: item_snippet(&item, snippets, src, line_starts),
             is_skip,
         });
     }
@@ -775,11 +931,40 @@ fn reorder_file(path: &Path) -> Result<()> {
 
     let is_entry_point = is_main_rs || is_build_rs;
 
+    // A file with no items has nothing to reorder. Leave it untouched so any
+    // file-level comments survive.
+    if file.items.is_empty() {
+        return Ok(());
+    }
+
     // Process all items together, sorted by category. #[rustfmt::skip] items
     // preserve their formatting (snippet) and their relative position within
     // their own category, but do NOT block items of other categories from
     // being reordered around them.
-    let all_items: Vec<Item> = file.items.drain(..).collect();
+    let all_items: Vec<Item> = std::mem::take(&mut file.items);
+    let footer = trailing_comments_after_last_item(&all_items, &src, &line_starts);
+
+    // Comments before the first item that are not attached to it are file-level
+    // header comments. Emit them at the top so reordering the first item cannot
+    // carry the header into the middle of the file.
+    let leading_header = first_item_attached_start(&all_items, &src, &line_starts)
+        .map(|end| {
+            let start = if crate_attrs.is_empty() {
+                shebang
+                    .as_ref()
+                    .map(|shebang| shebang.len() + 1)
+                    .unwrap_or(0)
+            } else {
+                crate_attrs
+                    .iter()
+                    .map(|attr| span_range(attr.span(), &src, &line_starts).end)
+                    .max()
+                    .unwrap_or(0)
+            };
+            src[start.min(end)..end].trim().to_string()
+        })
+        .filter(|header| !header.is_empty());
+
     let reordered = reorder_items_to_string(all_items, &src, &line_starts, is_entry_point);
 
     // Build output
@@ -793,9 +978,20 @@ fn reorder_file(path: &Path) -> Result<()> {
         out.push_str(header.trim_end());
         out.push_str("\n\n");
     }
+    if let Some(header) = leading_header {
+        out.push_str(&header);
+        out.push_str("\n\n");
+    }
 
     if !reordered.is_empty() {
         out.push_str(&reordered);
+    }
+
+    if let Some(footer) = footer {
+        while !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str(&footer);
     }
 
     while out.ends_with("\n\n\n") {
@@ -822,6 +1018,8 @@ fn reorder_items_to_string(
     line_starts: &[usize],
     is_entry_point: bool,
 ) -> String {
+    let snippets = build_item_snippets(&items, src, line_starts);
+
     // Partition items into struct/enum/union, fn, and other
     let (struct_enum_items, rest_items): (Vec<_>, Vec<_>) = items
         .into_iter()
@@ -878,18 +1076,22 @@ fn reorder_items_to_string(
     // --- Build buckets ---
     let mut buckets: Vec<Vec<BucketItem>> = (0..14).map(|_| Vec::new()).collect();
 
-    let impl_items = collect_impls_and_bucket_rest(other_items, &mut buckets, src, line_starts);
+    let impl_items =
+        collect_impls_and_bucket_rest(other_items, &mut buckets, &snippets, src, line_starts);
 
-    let type_order: Vec<String> = sorted_struct_enums
-        .iter()
-        .filter_map(|item| item_name(item))
-        .collect();
+    let type_order: Vec<String> = sorted_struct_enums.iter().filter_map(item_name).collect();
 
-    push_type_items(sorted_struct_enums, &mut buckets, src, line_starts);
+    push_type_items(
+        sorted_struct_enums,
+        &mut buckets,
+        &snippets,
+        src,
+        line_starts,
+    );
     push_ordered_impls(impl_items, &type_order, &mut buckets[10]);
 
     for item in sorted_fn_items.into_iter() {
-        let snippet = item_snippet(&item, src, line_starts);
+        let snippet = item_snippet(&item, &snippets, src, line_starts);
         let is_skip = paths::has_rustfmt_skip(item_attributes(&item));
         buckets[11].push(BucketItem {
             sort_key: item_sort_key(&item),
@@ -1227,5 +1429,7 @@ mod tests {
         assert_eq!(blank_lines_after(10), 1);
         assert_eq!(blank_lines_after(11), 1);
         assert_eq!(blank_lines_after(12), 1);
+        assert_eq!(blank_lines_after(13), 1);
+        assert_eq!(blank_lines_after(14), 1);
     }
 }
